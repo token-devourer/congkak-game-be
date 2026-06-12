@@ -161,6 +161,40 @@ export function kickPlayer(state: GameStateInternal, hostId: string, targetId: s
   }
 
   const target = findPlayer(state, targetId);
+
+  if (state.phase === "playing") {
+    if (
+      state.pendingChallenge &&
+      (state.pendingChallenge.offenderId === targetId || state.pendingChallenge.challengerId === targetId)
+    ) {
+      delete state.pendingChallenge;
+    }
+
+    if (state.oneWindow?.playerId === targetId) {
+      delete state.oneWindow;
+    }
+
+    // Resolve the next seat while the target still exists, then fold their
+    // cards back into the draw pile so the deck never silently shrinks.
+    const wasCurrent = state.currentSeat === target.seat;
+    const nextSeat = wasCurrent ? seatAfter(state, target.seat) : state.currentSeat;
+    state.players = state.players.filter((player) => player.id !== targetId);
+    state.drawPile = shuffleCards([...state.drawPile, ...target.hand]);
+    state.currentSeat = nextSeat;
+    if (wasCurrent) {
+      setTurnDeadline(state);
+    }
+
+    pushLog(state, "room", `${target.nickname} was kicked from the room.`);
+
+    const remaining = state.players[0];
+    if (state.players.length === 1 && remaining) {
+      completeRound(state, remaining.id);
+    }
+
+    return;
+  }
+
   state.players = state.players.filter((player) => player.id !== targetId);
   pushLog(state, "room", `${target.nickname} was kicked from the room.`);
 }
@@ -288,7 +322,13 @@ export function drawCard(state: GameStateInternal, playerId: string): void {
     throw new GameError("already_drew", "You already drew a card this turn.");
   }
 
-  const card = drawOne(state);
+  const card = takeCard(state);
+  if (!card) {
+    pushLog(state, "draw", `${player.nickname} passed because no cards were left.`);
+    advanceTurn(state);
+    return;
+  }
+
   player.hand.push(card);
   player.cardCount = player.hand.length;
   player.drawnCardId = card.id;
@@ -325,6 +365,7 @@ export function playDrawn(state: GameStateInternal, playerId: string, play: bool
 }
 
 export function callOne(state: GameStateInternal, playerId: string): void {
+  ensurePlaying(state);
   const player = findPlayer(state, playerId);
   const now = Date.now();
 
@@ -344,9 +385,14 @@ export function callOne(state: GameStateInternal, playerId: string): void {
 }
 
 export function catchOne(state: GameStateInternal, catcherId: string, targetId: string): void {
+  ensurePlaying(state);
   const catcher = findPlayer(state, catcherId);
   const target = findPlayer(state, targetId);
   const now = Date.now();
+
+  if (catcherId === targetId) {
+    throw new GameError("catch_failed", "You cannot catch yourself.");
+  }
 
   if (
     target.calledOne ||
@@ -359,10 +405,24 @@ export function catchOne(state: GameStateInternal, catcherId: string, targetId: 
     throw new GameError("catch_failed", "That player cannot be caught now.");
   }
 
+  // Closing the window is the double-catch guard; the caught player must NOT
+  // be credited with a One call they never made.
   drawMany(state, target, 2);
-  target.calledOne = true;
   delete state.oneWindow;
   pushLog(state, "one", `${catcher.nickname} caught ${target.nickname}.`);
+}
+
+// Lets the room ticker close stale windows and broadcast, so every client
+// hides its One/Catch buttons in sync with the server instead of guessing
+// from its own clock. Expiring is silent: missing the call only costs cards
+// when another player actually catches it.
+export function expireOneWindow(state: GameStateInternal): boolean {
+  if (!state.oneWindow || Date.now() <= state.oneWindow.deadline) {
+    return false;
+  }
+
+  delete state.oneWindow;
+  return true;
 }
 
 export function resolveChallenge(state: GameStateInternal, playerId: string, accept: boolean): void {
@@ -402,22 +462,38 @@ export function resolveChallenge(state: GameStateInternal, playerId: string, acc
 }
 
 export function handleTurnTimeout(state: GameStateInternal): boolean {
-  if (state.phase !== "playing" || state.pendingChallenge || !state.turnDeadline) {
+  if (state.phase !== "playing" || !state.turnDeadline || Date.now() < state.turnDeadline) {
     return false;
   }
 
-  if (Date.now() < state.turnDeadline) {
-    return false;
+  const pending = state.pendingChallenge;
+  if (pending) {
+    // An unanswered Wild Draw Four must not stall the game forever: when the
+    // turn timer lapses, resolve it as if the challenger declined.
+    const challenger = findPlayer(state, pending.challengerId);
+    const offender = findPlayer(state, pending.offenderId);
+    delete state.pendingChallenge;
+    drawMany(state, challenger, 4);
+    state.currentSeat = seatAfter(state, challenger.seat);
+    pushLog(state, "challenge", `${challenger.nickname} took four cards.`);
+    setTurnDeadline(state);
+
+    if (offender.hand.length === 0) {
+      completeRound(state, offender.id);
+    }
+
+    return true;
   }
 
   const player = currentPlayer(state);
   if (player.drawnCardId) {
     delete player.drawnCardId;
+    pushLog(state, "draw", `${player.nickname} passed after drawing.`);
   } else {
     drawMany(state, player, 1);
+    pushLog(state, "draw", `${player.nickname} timed out and drew one card.`);
   }
 
-  pushLog(state, "draw", `${player.nickname} timed out and drew one card.`);
   advanceTurn(state);
   return true;
 }
@@ -426,6 +502,7 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
   const self = playerId ? state.players.find((player) => player.id === playerId) : undefined;
   const snapshot: GameSnapshot = {
     seq: state.seq,
+    serverNow: Date.now(),
     code: state.code,
     phase: state.phase,
     settings: state.settings,
@@ -584,20 +661,33 @@ function completeRound(state: GameStateInternal, winnerId: string): void {
   pushLog(state, "round", `${winner.nickname} won the round with ${score} points.`);
 }
 
+// Penalty draws degrade gracefully when every card is already in players'
+// hands: take what is available instead of throwing mid-mutation.
 function drawMany(state: GameStateInternal, player: PlayerState, count: number): void {
   for (let index = 0; index < count; index += 1) {
-    player.hand.push(drawOne(state));
+    const card = takeCard(state);
+    if (!card) {
+      pushLog(state, "round", "The draw pile ran out of cards.");
+      break;
+    }
+
+    player.hand.push(card);
   }
 
   player.cardCount = player.hand.length;
 }
 
-function drawOne(state: GameStateInternal): Card {
+function takeCard(state: GameStateInternal): Card | undefined {
   if (state.drawPile.length === 0) {
     reshuffleDiscard(state);
   }
 
-  const card = state.drawPile.pop();
+  return state.drawPile.pop();
+}
+
+// Only used while dealing, where the deck can never run dry (10 × 7 + 1 < 108).
+function drawOne(state: GameStateInternal): Card {
+  const card = takeCard(state);
   if (!card) {
     throw new GameError("empty_deck", "No cards are available to draw.");
   }
@@ -606,11 +696,11 @@ function drawOne(state: GameStateInternal): Card {
 }
 
 function reshuffleDiscard(state: GameStateInternal): void {
-  const top = state.discardPile.pop();
-  if (!top) {
+  if (state.discardPile.length <= 1) {
     return;
   }
 
+  const top = state.discardPile.pop()!;
   state.drawPile = shuffleCards(state.discardPile);
   state.discardPile = [top];
   pushLog(state, "round", "Discard pile was shuffled into the draw pile.");

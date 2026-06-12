@@ -7,6 +7,8 @@ import {
   catchOne,
   createGame,
   drawCard,
+  expireOneWindow,
+  handleTurnTimeout,
   playCard,
   resolveChallenge,
   setReady,
@@ -156,6 +158,90 @@ describe("standard mode", () => {
 
     expect(state.discardPile).toHaveLength(1);
     expect(state.discardPile[0]!.id).toBe("top");
+  });
+
+  it("does not credit a caught player with a One call", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+
+    playCard(state, "p1", "red-1");
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+    catchOne(state, "p2", "p1");
+
+    expect(state.players[0]!.hand).toHaveLength(3);
+    expect(state.players[0]!.calledOne).toBe(false);
+    expect(() => catchOne(state, "p2", "p1")).toThrow("cannot be caught");
+  });
+
+  it("rejects catching yourself", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+
+    playCard(state, "p1", "red-1");
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+
+    expect(() => catchOne(state, "p1", "p1")).toThrow("catch yourself");
+    expect(state.players[0]!.hand).toHaveLength(1);
+  });
+
+  it("expires the One window silently without a penalty", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+
+    playCard(state, "p1", "red-1");
+    expect(expireOneWindow(state)).toBe(false);
+
+    state.oneWindow!.deadline = Date.now() - 1;
+
+    expect(expireOneWindow(state)).toBe(true);
+    expect(state.oneWindow).toBeUndefined();
+    expect(state.players[0]!.hand).toHaveLength(1);
+  });
+
+  it("passes the turn when there is nothing left to draw", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("green-9", "green", 9)];
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+    state.drawPile = [];
+    state.discardPile = [card("top", "red", 5)];
+
+    drawCard(state, "p1");
+
+    expect(state.players[0]!.hand).toHaveLength(1);
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+  });
+
+  it("draws only the available cards when a penalty exceeds the pile", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("draw2", "red", "draw2"), card("blue-2", "blue", 2)];
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+    state.drawPile = [];
+    state.discardPile = [card("top", "red", 5)];
+
+    // Only one card is recoverable (the buried "top"); the +2 penalty must
+    // deliver what exists instead of crashing the action.
+    playCard(state, "p1", "draw2");
+
+    expect(state.players[1]!.hand).toHaveLength(2);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
+  it("auto-resolves an unanswered Wild Draw Four when the timer lapses", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("wild4", null, "wild4"), card("red-9", "red", 9)];
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+
+    playCard(state, "p1", "wild4", "blue");
+    expect(state.pendingChallenge).toBeDefined();
+
+    state.turnDeadline = Date.now() - 1;
+    expect(handleTurnTimeout(state)).toBe(true);
+
+    expect(state.pendingChallenge).toBeUndefined();
+    expect(state.players[1]!.hand).toHaveLength(5);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
   });
 
   it("scores a finished round", () => {

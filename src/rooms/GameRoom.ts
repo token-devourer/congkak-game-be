@@ -16,6 +16,7 @@ import {
   catchOne,
   createGame,
   drawCard,
+  expireOneWindow,
   GameError,
   handleTurnTimeout,
   kickPlayer,
@@ -48,10 +49,16 @@ export class GameRoom extends Room {
     this.maxClients = this.game.settings.maxPlayers;
     this.setPrivate(true);
     this.clock.setInterval(() => {
-      if (handleTurnTimeout(this.game)) {
-        this.broadcastState();
+      try {
+        const timedOut = handleTurnTimeout(this.game);
+        const windowClosed = expireOneWindow(this.game);
+        if (timedOut || windowClosed) {
+          this.broadcastState();
+        }
+      } catch {
+        // The ticker must never take the room down; the next tick retries.
       }
-    }, 1000);
+    }, 500);
 
     this.onMessage("room.ready", (client, message) => this.safe(client, () => {
       setReady(this.game, client.sessionId, Boolean(message?.ready ?? true));

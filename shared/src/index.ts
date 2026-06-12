@@ -107,6 +107,9 @@ export interface GameLogEntry {
 
 export interface GameSnapshot {
   seq: number;
+  /** Server wall-clock at snapshot time; clients use it to offset their own
+   * clock so deadlines/windows count down in sync with the server. */
+  serverNow?: number;
   code: string;
   phase: GamePhase;
   settings: RoomSettings;
