@@ -11,9 +11,12 @@ import {
   handleTurnTimeout,
   playCard,
   resolveChallenge,
+  resolvePendingOneCall,
+  setPlayerConnected,
   setReady,
   snapshotFor,
   startRound,
+  updateSettings,
   type GameStateInternal
 } from "../src/engine/game.js";
 
@@ -37,6 +40,23 @@ function controlledGame(): GameStateInternal {
   state.direction = 1;
   state.players[0]!.hand = [];
   state.players[1]!.hand = [];
+  return state;
+}
+
+function controlledGame3(): GameStateInternal {
+  const state = createGame("ABC123", { turnTimeoutSec: 30 });
+  addPlayer(state, "p1", "Ava", "sun");
+  addPlayer(state, "p2", "Ben", "moon");
+  addPlayer(state, "p3", "Cy", "star");
+  state.phase = "playing";
+  state.activeColor = "red";
+  state.discardPile = [card("discard-red-5", "red", 5)];
+  state.drawPile = drawPile();
+  state.currentSeat = 0;
+  state.direction = 1;
+  state.players[0]!.hand = [];
+  state.players[1]!.hand = [];
+  state.players[2]!.hand = [];
   return state;
 }
 
@@ -105,7 +125,7 @@ describe("standard mode", () => {
     expect(state.oneWindow).toBeUndefined();
   });
 
-  it("allows a valid One call", () => {
+  it("allows a valid One call after the server arbitration buffer", () => {
     const state = controlledGame();
     state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
 
@@ -114,8 +134,69 @@ describe("standard mode", () => {
     state.oneWindow!.deadline = Date.now() + 1000;
     callOne(state, "p1");
 
+    expect(state.players[0]!.calledOne).toBe(false);
+    expect(snapshotFor(state, "p1").oneWindow?.callPending).toBe(true);
+
+    state.pendingOneCall!.resolvesAt = Date.now() - 1;
+    expect(resolvePendingOneCall(state)).toBe(true);
+
     expect(state.players[0]!.calledOne).toBe(true);
     expect(state.oneWindow).toBeUndefined();
+  });
+
+  it("lets a catch beat a pending One call during arbitration", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+
+    playCard(state, "p1", "red-1");
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+    callOne(state, "p1");
+    catchOne(state, "p2", "p1");
+
+    expect(state.players[0]!.hand).toHaveLength(3);
+    expect(state.players[0]!.calledOne).toBe(false);
+    expect(state.pendingOneCall).toBeUndefined();
+    expect(state.oneWindow).toBeUndefined();
+  });
+
+  it("blocks turn actions while a One call is still being arbitrated", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+    state.players[1]!.hand = [card("red-3", "red", 3), card("green-8", "green", 8)];
+
+    playCard(state, "p1", "red-1");
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+    callOne(state, "p1");
+
+    expect(() => playCard(state, "p2", "red-3")).toThrow("One call is still being resolved");
+
+    state.pendingOneCall!.resolvesAt = Date.now() - 1;
+    playCard(state, "p2", "red-3");
+
+    expect(state.players[0]!.calledOne).toBe(true);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
+  it("pauses turn timeout while a One call is still being arbitrated", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+    state.players[1]!.hand = [card("red-3", "red", 3), card("green-8", "green", 8)];
+
+    playCard(state, "p1", "red-1");
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+    callOne(state, "p1");
+    state.turnDeadline = Date.now() - 1;
+
+    expect(handleTurnTimeout(state)).toBe(false);
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+
+    state.pendingOneCall!.resolvesAt = Date.now() - 1;
+    expect(handleTurnTimeout(state)).toBe(true);
+    expect(state.players[0]!.calledOne).toBe(true);
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
   });
 
   it("rejects One calls before the shared window opens", () => {
@@ -198,6 +279,20 @@ describe("standard mode", () => {
     expect(expireOneWindow(state)).toBe(true);
     expect(state.oneWindow).toBeUndefined();
     expect(state.players[0]!.hand).toHaveLength(1);
+  });
+
+  it("closes a stale One window when the target no longer has one card", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+    state.players[1]!.hand = [card("red-draw2", "red", "draw2"), card("green-8", "green", 8), card("blue-9", "blue", 9)];
+
+    playCard(state, "p1", "red-1");
+    expect(state.oneWindow?.playerId).toBe("p1");
+
+    playCard(state, "p2", "red-draw2");
+
+    expect(state.players[0]!.hand).toHaveLength(3);
+    expect(state.oneWindow).toBeUndefined();
   });
 
   it("opens a fresh 108-card deck when there is nothing left to draw", () => {
@@ -284,5 +379,92 @@ describe("standard mode", () => {
     expect([7, 9]).toContain(state.players[0]!.hand.length);
     expect(state.players[1]!.hand).toHaveLength(7);
     expect(state.discardPile).toHaveLength(1);
+  });
+
+  it("rejects a malicious round restart while playing", () => {
+    const state = controlledGame();
+
+    expect(() => startRound(state)).toThrow("already in progress");
+    expect(state.phase).toBe("playing");
+  });
+
+  it("removes disconnected lobby players before dealing", () => {
+    const state = createGame("ABC123");
+    addPlayer(state, "p1", "Ava", "sun");
+    addPlayer(state, "p2", "Ben", "moon");
+    addPlayer(state, "p3", "Cy", "star");
+    setReady(state, "p2", true);
+    setReady(state, "p3", true);
+
+    setPlayerConnected(state, "p3", false);
+    startRound(state);
+
+    expect(state.players.map((player) => player.id)).toEqual(["p1", "p2"]);
+    expect(state.players.every((player) => player.hand.length >= 7)).toBe(true);
+  });
+
+  it("rejects reducing max players below the occupied seats", () => {
+    const state = createGame("ABC123", { maxPlayers: 4 });
+    addPlayer(state, "p1", "Ava", "sun");
+    addPlayer(state, "p2", "Ben", "moon");
+    addPlayer(state, "p3", "Cy", "star");
+
+    expect(() => updateSettings(state, "p1", { maxPlayers: 2 })).toThrow("current room size");
+    expect(state.settings.maxPlayers).toBe(4);
+  });
+
+  it("plays a deterministic action-card sequence without stale One/Catch state", () => {
+    const state = controlledGame3();
+    state.players[0]!.hand = [card("p1-red-1", "red", 1), card("p1-green-1", "green", 1)];
+    state.players[1]!.hand = [card("p2-red-draw2", "red", "draw2"), card("p2-wild4", null, "wild4"), card("p2-blue-4", "blue", 4)];
+    state.players[2]!.hand = [card("p3-green-8", "green", 8), card("p3-blue-8", "blue", 8), card("p3-yellow-8", "yellow", 8)];
+    state.drawPile = [
+      card("challenge-1", "yellow", 1),
+      card("challenge-2", "yellow", 2),
+      card("challenge-3", "yellow", 3),
+      card("challenge-4", "yellow", 4),
+      card("challenge-5", "yellow", 5),
+      card("challenge-6", "yellow", 6),
+      card("p1-catch-blue-9", "blue", 9),
+      card("p1-catch-red-7", "red", 7),
+      card("p3-draw2-blue-1", "blue", 1),
+      card("p3-draw2-blue-2", "blue", 2)
+    ];
+
+    playCard(state, "p1", "p1-red-1");
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+    expect(state.oneWindow?.playerId).toBe("p1");
+
+    playCard(state, "p2", "p2-red-draw2");
+    expect(state.players[2]!.hand).toHaveLength(5);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+    expect(state.oneWindow?.playerId).toBe("p1");
+
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+    catchOne(state, "p2", "p1");
+    expect(state.players[0]!.hand.map((item) => item.id)).toContain("p1-catch-red-7");
+    expect(state.oneWindow).toBeUndefined();
+
+    playCard(state, "p1", "p1-catch-red-7");
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+
+    playCard(state, "p2", "p2-wild4", "blue");
+    expect(state.pendingChallenge).toMatchObject({ offenderId: "p2", challengerId: "p3", guilty: false });
+    expect(state.oneWindow?.playerId).toBe("p2");
+
+    resolveChallenge(state, "p3", true);
+    expect(state.pendingChallenge).toBeUndefined();
+    expect(state.players[2]!.hand).toHaveLength(11);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
+    callOne(state, "p2");
+    state.pendingOneCall!.resolvesAt = Date.now() - 1;
+    expect(resolvePendingOneCall(state)).toBe(true);
+
+    expect(state.players[1]!.calledOne).toBe(true);
+    expect(state.oneWindow).toBeUndefined();
   });
 });

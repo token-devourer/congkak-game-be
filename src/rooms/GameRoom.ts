@@ -24,6 +24,7 @@ import {
   playDrawn,
   removePlayer,
   resolveChallenge,
+  resolvePendingOneCall,
   sendEmote,
   setPlayerConnected,
   setReady,
@@ -50,15 +51,16 @@ export class GameRoom extends Room {
     this.setPrivate(true);
     this.clock.setInterval(() => {
       try {
+        const oneCallResolved = resolvePendingOneCall(this.game);
         const timedOut = handleTurnTimeout(this.game);
         const windowClosed = expireOneWindow(this.game);
-        if (timedOut || windowClosed) {
+        if (oneCallResolved || timedOut || windowClosed) {
           this.broadcastState();
         }
       } catch {
         // The ticker must never take the room down; the next tick retries.
       }
-    }, 500);
+    }, 100);
 
     this.onMessage("room.ready", (client, message) => this.safe(client, () => {
       setReady(this.game, client.sessionId, Boolean(message?.ready ?? true));

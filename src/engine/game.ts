@@ -13,8 +13,9 @@ import type {
 import { COLORS, mergeRoomSettings } from "@congcard/shared";
 import { standardMode, shuffleCards, buildSingleDeck } from "./modes/standard.js";
 
-const ONE_CALL_DELAY_MS = 700;
+const ONE_CALL_DELAY_MS = 1200;
 const ONE_CALL_WINDOW_MS = 3000;
+const ONE_CALL_SETTLE_MS = 250;
 
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
@@ -34,6 +35,7 @@ export interface GameStateInternal {
   turnDeadline?: number;
   pendingChallenge?: PendingChallenge;
   oneWindow?: { playerId: string; opensAt: number; deadline: number };
+  pendingOneCall?: { playerId: string; resolvesAt: number };
   roundNumber: number;
   seq: number;
   actionLog: GameLogEntry[];
@@ -111,6 +113,7 @@ export function setPlayerConnected(state: GameStateInternal, id: string, connect
   const player = findPlayer(state, id);
   player.connected = connected;
   if (!connected) {
+    player.ready = false;
     pushLog(state, "room", `${player.nickname} disconnected.`);
   } else {
     pushLog(state, "room", `${player.nickname} reconnected.`);
@@ -146,7 +149,12 @@ export function updateSettings(state: GameStateInternal, id: string, input: Room
     throw new GameError("settings_locked", "Room settings are locked after the game starts.");
   }
 
-  state.settings = mergeRoomSettings({ ...state.settings, ...input });
+  const nextSettings = mergeRoomSettings({ ...state.settings, ...input });
+  if (nextSettings.maxPlayers < state.players.length) {
+    throw new GameError("max_players_too_low", "Max players cannot be lower than the current room size.");
+  }
+
+  state.settings = nextSettings;
   pushLog(state, "room", "Room settings were updated.");
 }
 
@@ -172,6 +180,10 @@ export function kickPlayer(state: GameStateInternal, hostId: string, targetId: s
 
     if (state.oneWindow?.playerId === targetId) {
       delete state.oneWindow;
+    }
+
+    if (state.pendingOneCall?.playerId === targetId) {
+      delete state.pendingOneCall;
     }
 
     // Resolve the next seat while the target still exists, then fold their
@@ -200,15 +212,29 @@ export function kickPlayer(state: GameStateInternal, hostId: string, targetId: s
 }
 
 export function startRound(state: GameStateInternal): void {
+  if (state.phase === "playing") {
+    throw new GameError("game_in_progress", "This round is already in progress.");
+  }
+
+  if (state.phase === "gameEnd") {
+    throw new GameError("game_finished", "This game has already ended.");
+  }
+
   const mode = getMode(state.settings);
-  const activePlayers = sortedPlayers(state);
+  const activePlayers = sortedPlayers(state).filter((player) => player.connected);
 
   if (activePlayers.length < 2) {
-    throw new GameError("not_enough_players", "At least two players are required.");
+    throw new GameError("not_enough_players", "At least two connected players are required.");
   }
 
   if (state.phase === "lobby" && activePlayers.some((player) => !player.ready && !player.isHost)) {
     throw new GameError("players_not_ready", "All non-host players must be ready.");
+  }
+
+  if (activePlayers.length !== state.players.length) {
+    state.players = activePlayers;
+    assignHost(state);
+    pushLog(state, "room", "Disconnected players were removed before the round started.");
   }
 
   state.phase = "playing";
@@ -217,6 +243,7 @@ export function startRound(state: GameStateInternal): void {
   state.discardPile = [];
   delete state.pendingChallenge;
   delete state.oneWindow;
+  delete state.pendingOneCall;
   delete state.roundWinnerId;
   delete state.gameWinnerId;
   state.roundNumber += 1;
@@ -253,6 +280,7 @@ export function startRound(state: GameStateInternal): void {
 
 export function playCard(state: GameStateInternal, playerId: string, cardId: string, declaredColor?: Color): void {
   ensurePlaying(state);
+  ensureNoPendingOneCall(state);
   ensureNoPendingChallenge(state);
   const mode = getMode(state.settings);
   const player = currentPlayer(state);
@@ -310,6 +338,7 @@ export function playCard(state: GameStateInternal, playerId: string, cardId: str
 
 export function drawCard(state: GameStateInternal, playerId: string): void {
   ensurePlaying(state);
+  ensureNoPendingOneCall(state);
   ensureNoPendingChallenge(state);
   const mode = getMode(state.settings);
   const player = currentPlayer(state);
@@ -330,7 +359,7 @@ export function drawCard(state: GameStateInternal, playerId: string): void {
   }
 
   player.hand.push(card);
-  player.cardCount = player.hand.length;
+  syncPlayerHandChange(state, player);
   player.drawnCardId = card.id;
   player.calledOne = false;
   pushLog(state, "draw", `${player.nickname} drew one card.`);
@@ -344,6 +373,8 @@ export function drawCard(state: GameStateInternal, playerId: string): void {
 
 export function playDrawn(state: GameStateInternal, playerId: string, play: boolean, declaredColor?: Color): void {
   ensurePlaying(state);
+  ensureNoPendingOneCall(state);
+  ensureNoPendingChallenge(state);
   const player = currentPlayer(state);
 
   if (player.id !== playerId) {
@@ -367,27 +398,39 @@ export function playDrawn(state: GameStateInternal, playerId: string, play: bool
 export function callOne(state: GameStateInternal, playerId: string): void {
   ensurePlaying(state);
   const player = findPlayer(state, playerId);
+  const oneWindow = state.oneWindow;
   const now = Date.now();
+
+  if (state.pendingOneCall?.playerId === playerId) {
+    return;
+  }
 
   if (
     player.hand.length !== 1 ||
-    !state.oneWindow ||
-    state.oneWindow.playerId !== playerId ||
-    now < state.oneWindow.opensAt ||
-    now > state.oneWindow.deadline
+    !oneWindow ||
+    oneWindow.playerId !== playerId ||
+    now < oneWindow.opensAt ||
+    now > oneWindow.deadline
   ) {
     throw new GameError("cannot_call_one", "You can only call One while your One window is open.");
   }
 
-  player.calledOne = true;
-  delete state.oneWindow;
-  pushLog(state, "one", `${player.nickname} called One.`);
+  // Do not finalize instantly: give catch packets that were already in flight
+  // a short server-side arbitration buffer, so host/low-latency clients do not
+  // win purely because their message reached the room first.
+  state.pendingOneCall = {
+    playerId,
+    resolvesAt: now + ONE_CALL_SETTLE_MS
+  };
 }
 
 export function catchOne(state: GameStateInternal, catcherId: string, targetId: string): void {
   ensurePlaying(state);
   const catcher = findPlayer(state, catcherId);
   const target = findPlayer(state, targetId);
+  const oneWindow = state.oneWindow;
+  const pendingCall = state.pendingOneCall?.playerId === targetId;
+  const catchDeadline = oneWindow ? Math.max(oneWindow.deadline, pendingCall ? state.pendingOneCall!.resolvesAt : oneWindow.deadline) : 0;
   const now = Date.now();
 
   if (catcherId === targetId) {
@@ -397,10 +440,10 @@ export function catchOne(state: GameStateInternal, catcherId: string, targetId: 
   if (
     target.calledOne ||
     target.hand.length !== 1 ||
-    !state.oneWindow ||
-    state.oneWindow.playerId !== targetId ||
-    now < state.oneWindow.opensAt ||
-    now > state.oneWindow.deadline
+    !oneWindow ||
+    oneWindow.playerId !== targetId ||
+    now < oneWindow.opensAt ||
+    now > catchDeadline
   ) {
     throw new GameError("catch_failed", "That player cannot be caught now.");
   }
@@ -408,8 +451,18 @@ export function catchOne(state: GameStateInternal, catcherId: string, targetId: 
   // Closing the window is the double-catch guard; the caught player must NOT
   // be credited with a One call they never made.
   drawMany(state, target, 2);
-  delete state.oneWindow;
+  closeOneWindowForPlayer(state, target.id);
   pushLog(state, "one", `${catcher.nickname} caught ${target.nickname}.`);
+}
+
+export function resolvePendingOneCall(state: GameStateInternal): boolean {
+  const pending = state.pendingOneCall;
+  if (!pending || Date.now() < pending.resolvesAt) {
+    return false;
+  }
+
+  finalizePendingOneCall(state);
+  return true;
 }
 
 // Lets the room ticker close stale windows and broadcast, so every client
@@ -417,16 +470,17 @@ export function catchOne(state: GameStateInternal, catcherId: string, targetId: 
 // from its own clock. Expiring is silent: missing the call only costs cards
 // when another player actually catches it.
 export function expireOneWindow(state: GameStateInternal): boolean {
-  if (!state.oneWindow || Date.now() <= state.oneWindow.deadline) {
+  if (!state.oneWindow || Date.now() <= state.oneWindow.deadline || state.pendingOneCall?.playerId === state.oneWindow.playerId) {
     return false;
   }
 
-  delete state.oneWindow;
+  closeOneWindowForPlayer(state, state.oneWindow.playerId);
   return true;
 }
 
 export function resolveChallenge(state: GameStateInternal, playerId: string, accept: boolean): void {
   ensurePlaying(state);
+  ensureNoPendingOneCall(state);
   const pending = state.pendingChallenge;
   if (!pending) {
     throw new GameError("no_challenge", "There is no Wild Draw Four to challenge.");
@@ -463,6 +517,15 @@ export function resolveChallenge(state: GameStateInternal, playerId: string, acc
 
 export function handleTurnTimeout(state: GameStateInternal): boolean {
   if (state.phase !== "playing" || !state.turnDeadline || Date.now() < state.turnDeadline) {
+    return false;
+  }
+
+  if (state.pendingOneCall) {
+    if (Date.now() >= state.pendingOneCall.resolvesAt) {
+      finalizePendingOneCall(state);
+      return true;
+    }
+
     return false;
   }
 
@@ -544,7 +607,12 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
   }
 
   if (state.oneWindow) {
-    snapshot.oneWindow = state.oneWindow;
+    snapshot.oneWindow = {
+      ...state.oneWindow,
+      ...(state.pendingOneCall?.playerId === state.oneWindow.playerId
+        ? { callPending: true, callResolvesAt: state.pendingOneCall.resolvesAt }
+        : {})
+    };
   }
 
   if (state.roundWinnerId) {
@@ -627,6 +695,7 @@ function applyPlayedCard(state: GameStateInternal, player: PlayerState, card: Ca
 function updateOneWindowAfterPlay(state: GameStateInternal, player: PlayerState): void {
   if (player.hand.length === 1) {
     const opensAt = Date.now() + ONE_CALL_DELAY_MS;
+    finalizePendingOneCall(state);
     player.calledOne = false;
     state.oneWindow = {
       playerId: player.id,
@@ -635,9 +704,7 @@ function updateOneWindowAfterPlay(state: GameStateInternal, player: PlayerState)
     };
   } else {
     player.calledOne = false;
-    if (state.oneWindow?.playerId === player.id) {
-      delete state.oneWindow;
-    }
+    closeOneWindowForPlayer(state, player.id);
   }
 }
 
@@ -658,7 +725,45 @@ function completeRound(state: GameStateInternal, winnerId: string): void {
   delete state.turnDeadline;
   delete state.pendingChallenge;
   delete state.oneWindow;
+  delete state.pendingOneCall;
   pushLog(state, "round", `${winner.nickname} won the round with ${score} points.`);
+}
+
+function finalizePendingOneCall(state: GameStateInternal): void {
+  const pending = state.pendingOneCall;
+  if (!pending) {
+    return;
+  }
+
+  delete state.pendingOneCall;
+
+  const player = state.players.find((item) => item.id === pending.playerId);
+  if (state.phase !== "playing" || !player || player.hand.length !== 1 || state.oneWindow?.playerId !== pending.playerId) {
+    return;
+  }
+
+  player.calledOne = true;
+  delete state.oneWindow;
+  pushLog(state, "one", `${player.nickname} called One.`);
+}
+
+function closeOneWindowForPlayer(state: GameStateInternal, playerId: string): void {
+  if (state.oneWindow?.playerId === playerId) {
+    delete state.oneWindow;
+  }
+
+  if (state.pendingOneCall?.playerId === playerId) {
+    delete state.pendingOneCall;
+  }
+}
+
+function syncPlayerHandChange(state: GameStateInternal, player: PlayerState): void {
+  player.cardCount = player.hand.length;
+
+  if (player.hand.length !== 1) {
+    player.calledOne = false;
+    closeOneWindowForPlayer(state, player.id);
+  }
 }
 
 // Penalty draws degrade gracefully when every card is already in players'
@@ -674,7 +779,7 @@ function drawMany(state: GameStateInternal, player: PlayerState, count: number):
     player.hand.push(card);
   }
 
-  player.cardCount = player.hand.length;
+  syncPlayerHandChange(state, player);
 }
 
 function takeCard(state: GameStateInternal): Card | undefined {
@@ -843,6 +948,20 @@ function ensureNoPendingChallenge(state: GameStateInternal): void {
   if (state.pendingChallenge) {
     throw new GameError("pending_challenge", "Resolve the Wild Draw Four challenge first.");
   }
+}
+
+function ensureNoPendingOneCall(state: GameStateInternal): void {
+  const pending = state.pendingOneCall;
+  if (!pending) {
+    return;
+  }
+
+  if (Date.now() >= pending.resolvesAt) {
+    finalizePendingOneCall(state);
+    return;
+  }
+
+  throw new GameError("one_call_pending", "A One call is still being resolved.");
 }
 
 function cardLabel(card: Card): string {
