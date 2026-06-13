@@ -48,6 +48,7 @@ export type CardValue = (typeof CARD_VALUES)[number];
 export type GamePhase = "lobby" | "playing" | "roundEnd" | "gameEnd";
 export type Direction = 1 | -1;
 export type ScoreTarget = 0 | 500;
+export type ParticipantRole = "player" | "waiting" | "spectator";
 export type ActionType =
   | "playCard"
   | "drawCard"
@@ -68,6 +69,7 @@ export interface RoomSettings {
   maxPlayers: number;
   turnTimeoutSec: number;
   scoreTarget: ScoreTarget;
+  allowMidGameJoin: boolean;
   modeOptions: Record<string, unknown>;
 }
 
@@ -76,6 +78,7 @@ export type RoomSettingsInput = {
   maxPlayers?: RoomSettings["maxPlayers"] | undefined;
   turnTimeoutSec?: RoomSettings["turnTimeoutSec"] | undefined;
   scoreTarget?: RoomSettings["scoreTarget"] | undefined;
+  allowMidGameJoin?: RoomSettings["allowMidGameJoin"] | undefined;
   modeOptions?: RoomSettings["modeOptions"] | undefined;
 };
 
@@ -90,12 +93,24 @@ export interface PublicPlayer {
   isHost: boolean;
   ready: boolean;
   calledOne: boolean;
+  autoPlay: boolean;
+  missedDisconnectedTurns: number;
 }
 
 export interface PrivatePlayerState {
   id: string;
+  role: ParticipantRole;
   hand: Card[];
   drawnCardId?: string;
+  resumeToken?: string;
+}
+
+export interface PublicViewer {
+  id: string;
+  nickname: string;
+  avatarId: string;
+  connected: boolean;
+  role: Exclude<ParticipantRole, "player">;
 }
 
 export interface PendingChallenge {
@@ -139,6 +154,7 @@ export interface GameSnapshot {
   phase: GamePhase;
   settings: RoomSettings;
   players: PublicPlayer[];
+  viewers: PublicViewer[];
   self?: PrivatePlayerState;
   discardTop?: Card;
   activeColor?: Color;
@@ -182,6 +198,7 @@ export const DEFAULT_ROOM_SETTINGS: RoomSettings = {
   maxPlayers: 10,
   turnTimeoutSec: 30,
   scoreTarget: 0,
+  allowMidGameJoin: true,
   modeOptions: {}
 };
 
@@ -190,6 +207,7 @@ export const roomSettingsSchema = z.object({
   maxPlayers: z.number().int().min(2).max(10).default(10),
   turnTimeoutSec: z.number().int().min(15).max(60).default(30),
   scoreTarget: z.union([z.literal(0), z.literal(500)]).default(0),
+  allowMidGameJoin: z.boolean().default(true),
   modeOptions: z.record(z.string(), z.unknown()).default({})
 });
 
@@ -198,7 +216,8 @@ export const roomCodeSchema = z.string().transform(normalizeRoomCode).pipe(z.str
 export const joinOptionsSchema = z.object({
   nickname: z.string().trim().min(1).max(20),
   avatarId: z.enum(AVATARS),
-  reconnectToken: z.string().max(512).optional()
+  reconnectToken: z.string().max(512).optional(),
+  resumeToken: z.string().max(256).optional()
 });
 
 export const playCardSchema = z.object({
@@ -239,6 +258,7 @@ export function mergeRoomSettings(input?: RoomSettingsInput): RoomSettings {
     maxPlayers: parsed.maxPlayers ?? DEFAULT_ROOM_SETTINGS.maxPlayers,
     turnTimeoutSec: parsed.turnTimeoutSec ?? DEFAULT_ROOM_SETTINGS.turnTimeoutSec,
     scoreTarget: parsed.scoreTarget ?? DEFAULT_ROOM_SETTINGS.scoreTarget,
+    allowMidGameJoin: parsed.allowMidGameJoin ?? DEFAULT_ROOM_SETTINGS.allowMidGameJoin,
     modeOptions: parsed.modeOptions ?? DEFAULT_ROOM_SETTINGS.modeOptions
   };
 }

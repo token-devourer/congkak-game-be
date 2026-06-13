@@ -24,6 +24,7 @@ import {
   playDrawn,
   removePlayer,
   resolveChallenge,
+  resolveAutomatedTurns,
   resolvePendingOneCall,
   sendEmote,
   setPlayerConnected,
@@ -49,21 +50,23 @@ const CLIENT_MESSAGE_WINDOW_MS = 10_000;
 const CLIENT_MESSAGE_LIMIT = 80;
 
 export class GameRoom extends Room {
-  maxClients = 10;
+  maxClients = 40;
   private game!: GameStateInternal;
   private readonly clientRateBuckets = new Map<string, ClientRateBucket>();
 
   onCreate(options: GameRoomOptions): void {
     const settings = roomSettingsSchema.partial().parse(options.settings ?? {});
     this.game = createGame(options.code, settings);
-    this.maxClients = this.game.settings.maxPlayers;
+    this.maxClients = Math.max(40, this.game.settings.maxPlayers + 20);
     this.setPrivate(true);
     this.clock.setInterval(() => {
       try {
         const oneCallResolved = resolvePendingOneCall(this.game);
-        const timedOut = handleTurnTimeout(this.game);
         const windowClosed = expireOneWindow(this.game);
-        if (oneCallResolved || timedOut || windowClosed) {
+        const autoPlayedBeforeTimeout = resolveAutomatedTurns(this.game);
+        const timedOut = handleTurnTimeout(this.game);
+        const autoPlayedAfterTimeout = resolveAutomatedTurns(this.game);
+        if (oneCallResolved || windowClosed || autoPlayedBeforeTimeout || timedOut || autoPlayedAfterTimeout) {
           this.broadcastState();
         }
       } catch {
@@ -79,7 +82,7 @@ export class GameRoom extends Room {
     this.onMessage("room.updateSettings", (client, message) => this.safe(client, () => {
       const settingsUpdate = roomSettingsSchema.partial().parse(message ?? {});
       updateSettings(this.game, client.sessionId, settingsUpdate);
-      this.maxClients = this.game.settings.maxPlayers;
+      this.maxClients = Math.max(40, this.game.settings.maxPlayers + 20);
       this.broadcastState();
     }));
 
@@ -142,13 +145,15 @@ export class GameRoom extends Room {
 
   onJoin(client: Client, options: unknown): void {
     const payload = joinOptionsSchema.parse(options);
-    addPlayer(this.game, client.sessionId, payload.nickname, payload.avatarId);
+    addPlayer(this.game, client.sessionId, payload.nickname, payload.avatarId, payload.resumeToken);
     this.broadcastState();
   }
 
   async onDrop(client: Client): Promise<void> {
-    const player = this.game.players.find((item) => item.id === client.sessionId);
-    if (!player) {
+    const participant =
+      this.game.players.find((item) => item.id === client.sessionId) ??
+      this.game.viewers.find((item) => item.id === client.sessionId);
+    if (!participant) {
       return;
     }
 
@@ -164,8 +169,15 @@ export class GameRoom extends Room {
 
   onLeave(client: Client): void {
     this.clientRateBuckets.delete(client.sessionId);
-    if (this.game.players.some((item) => item.id === client.sessionId)) {
+    if (this.game.viewers.some((item) => item.id === client.sessionId)) {
       removePlayer(this.game, client.sessionId);
+      this.broadcastState();
+      return;
+    }
+
+    const player = this.game.players.find((item) => item.id === client.sessionId);
+    if (player?.connected) {
+      setPlayerConnected(this.game, client.sessionId, false);
       this.broadcastState();
     }
   }

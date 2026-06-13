@@ -10,6 +10,7 @@ import {
   expireOneWindow,
   handleTurnTimeout,
   playCard,
+  resolveAutomatedTurns,
   resolveChallenge,
   resolvePendingOneCall,
   setPlayerConnected,
@@ -353,6 +354,48 @@ describe("standard mode", () => {
 
     state.turnDeadline = Date.now() - 1;
     expect(handleTurnTimeout(state)).toBe(true);
+
+    expect(state.pendingChallenge).toBeUndefined();
+    expect(state.players[1]!.hand).toHaveLength(5);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
+  it("enables immediate auto turns after two disconnected misses", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-9", "red", 9)];
+    state.players[1]!.hand = [card("blue-8", "blue", 8)];
+    setPlayerConnected(state, "p1", false);
+
+    state.currentSeat = 0;
+    state.turnDeadline = Date.now() - 1;
+    expect(handleTurnTimeout(state)).toBe(true);
+    expect(state.players[0]!.missedDisconnectedTurns).toBe(1);
+    expect(state.players[0]!.autoPlay).toBe(false);
+
+    state.currentSeat = 0;
+    state.turnDeadline = Date.now() - 1;
+    expect(handleTurnTimeout(state)).toBe(true);
+    expect(state.players[0]!.missedDisconnectedTurns).toBe(2);
+    expect(state.players[0]!.autoPlay).toBe(true);
+
+    const handSize = state.players[0]!.hand.length;
+    state.currentSeat = 0;
+    state.turnDeadline = Date.now() + 30_000;
+    expect(resolveAutomatedTurns(state)).toBe(true);
+    expect(state.players[0]!.hand).toHaveLength(handSize + 1);
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+  });
+
+  it("auto-accepts a disconnected challenge turn once auto play is enabled", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-9", "red", 9)];
+    state.players[1]!.connected = false;
+    state.players[1]!.autoPlay = true;
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+    state.pendingChallenge = { offenderId: "p1", challengerId: "p2", declaredColor: "blue", guilty: false };
+    state.currentSeat = 1;
+
+    expect(resolveAutomatedTurns(state)).toBe(true);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(5);

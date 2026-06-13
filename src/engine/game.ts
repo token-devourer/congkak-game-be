@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type {
   Card,
   Color,
@@ -5,8 +6,10 @@ import type {
   GameMode,
   GamePhase,
   GameSnapshot,
+  ParticipantRole,
   PendingChallenge,
   PublicPlayer,
+  PublicViewer,
   RoomSettings,
   RoomSettingsInput
 } from "@congcard/shared";
@@ -21,17 +24,23 @@ import { standardMode, shuffleCards, buildSingleDeck } from "./modes/standard.js
 const ONE_CALL_DELAY_MS = 0;
 const ONE_CALL_WINDOW_MS = 4000;
 const ONE_CALL_SETTLE_MS = 250;
+const AUTO_PLAY_AFTER_MISSED_TURNS = 2;
+const RESUME_TOKEN_BYTES = 24;
 
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
   drawnCardId?: string;
+  resumeToken: string;
 }
+
+export type ViewerState = PublicViewer;
 
 export interface GameStateInternal {
   code: string;
   phase: GamePhase;
   settings: RoomSettings;
   players: PlayerState[];
+  viewers: ViewerState[];
   drawPile: Card[];
   discardPile: Card[];
   activeColor?: Color;
@@ -63,6 +72,7 @@ export function createGame(code: string, settings?: RoomSettingsInput): GameStat
     phase: "lobby",
     settings: mergeRoomSettings(settings),
     players: [],
+    viewers: [],
     drawPile: [],
     discardPile: [],
     direction: 1,
@@ -81,16 +91,48 @@ export function getMode(settings: RoomSettings): GameMode {
   return standardMode;
 }
 
-export function addPlayer(state: GameStateInternal, id: string, nickname: string, avatarId: string): void {
+export function addPlayer(
+  state: GameStateInternal,
+  id: string,
+  nickname: string,
+  avatarId: string,
+  resumeToken?: string
+): ParticipantRole {
   const existing = state.players.find((player) => player.id === id);
   if (existing) {
-    existing.connected = true;
-    pushLog(state, "room", `${existing.nickname} reconnected.`);
-    return;
+    connectPlayer(state, existing);
+    return "player";
+  }
+
+  const existingViewer = state.viewers.find((viewer) => viewer.id === id);
+  if (existingViewer) {
+    existingViewer.connected = true;
+    existingViewer.nickname = nickname;
+    existingViewer.avatarId = avatarId;
+    pushLog(state, "room", `${existingViewer.nickname} reconnected as ${viewerRoleLabel(existingViewer.role)}.`);
+    return existingViewer.role;
+  }
+
+  const resumable = resumeToken ? state.players.find((player) => player.resumeToken === resumeToken) : undefined;
+  if (resumable) {
+    rebindPlayerSession(state, resumable.id, id);
+    resumable.nickname = nickname;
+    resumable.avatarId = avatarId;
+    connectPlayer(state, resumable);
+    return "player";
   }
 
   if (state.phase !== "lobby") {
-    throw new GameError("game_in_progress", "This room is already playing.");
+    const role = state.phase === "gameEnd" || !state.settings.allowMidGameJoin ? "spectator" : "waiting";
+    state.viewers.push({
+      id,
+      nickname,
+      avatarId,
+      connected: true,
+      role
+    });
+    pushLog(state, "room", `${nickname} joined as ${viewerRoleLabel(role)}.`);
+    return role;
   }
 
   if (state.players.length >= state.settings.maxPlayers) {
@@ -109,23 +151,42 @@ export function addPlayer(state: GameStateInternal, id: string, nickname: string
     isHost: state.players.length === 0,
     ready: false,
     calledOne: false,
-    hand: []
+    autoPlay: false,
+    missedDisconnectedTurns: 0,
+    hand: [],
+    resumeToken: createResumeToken(state)
   });
   pushLog(state, "room", `${nickname} joined the room.`);
+  return "player";
 }
 
 export function setPlayerConnected(state: GameStateInternal, id: string, connected: boolean): void {
+  const viewer = state.viewers.find((item) => item.id === id);
+  if (viewer) {
+    viewer.connected = connected;
+    pushLog(state, "room", `${viewer.nickname} ${connected ? "reconnected" : "disconnected"}.`);
+    return;
+  }
+
   const player = findPlayer(state, id);
-  player.connected = connected;
   if (!connected) {
+    player.connected = false;
     player.ready = false;
     pushLog(state, "room", `${player.nickname} disconnected.`);
+    assignHost(state);
   } else {
-    pushLog(state, "room", `${player.nickname} reconnected.`);
+    connectPlayer(state, player);
   }
 }
 
 export function removePlayer(state: GameStateInternal, id: string): void {
+  const viewer = state.viewers.find((item) => item.id === id);
+  if (viewer) {
+    state.viewers = state.viewers.filter((item) => item.id !== id);
+    pushLog(state, "room", `${viewer.nickname} left the room.`);
+    return;
+  }
+
   const player = findPlayer(state, id);
   if (state.phase === "lobby") {
     state.players = state.players.filter((item) => item.id !== id);
@@ -226,20 +287,28 @@ export function startRound(state: GameStateInternal): void {
   }
 
   const mode = getMode(state.settings);
-  const activePlayers = sortedPlayers(state).filter((player) => player.connected);
+
+  if (state.phase === "roundEnd") {
+    promoteWaitingPlayers(state);
+  }
+
+  let activePlayers = sortedPlayers(state);
+  if (state.phase === "lobby") {
+    activePlayers = activePlayers.filter((player) => player.connected);
+
+    if (activePlayers.some((player) => !player.ready && !player.isHost)) {
+      throw new GameError("players_not_ready", "All non-host players must be ready.");
+    }
+
+    if (activePlayers.length !== state.players.length) {
+      state.players = activePlayers;
+      assignHost(state);
+      pushLog(state, "room", "Disconnected lobby players were removed before the round started.");
+    }
+  }
 
   if (activePlayers.length < 2) {
-    throw new GameError("not_enough_players", "At least two connected players are required.");
-  }
-
-  if (state.phase === "lobby" && activePlayers.some((player) => !player.ready && !player.isHost)) {
-    throw new GameError("players_not_ready", "All non-host players must be ready.");
-  }
-
-  if (activePlayers.length !== state.players.length) {
-    state.players = activePlayers;
-    assignHost(state);
-    pushLog(state, "room", "Disconnected players were removed before the round started.");
+    throw new GameError("not_enough_players", "At least two player seats are required.");
   }
 
   state.phase = "playing";
@@ -540,6 +609,7 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
     // turn timer lapses, resolve it as if the challenger declined.
     const challenger = findPlayer(state, pending.challengerId);
     const offender = findPlayer(state, pending.offenderId);
+    markMissedDisconnectedTurn(state, challenger);
     delete state.pendingChallenge;
     drawMany(state, challenger, 4);
     state.currentSeat = seatAfter(state, challenger.seat);
@@ -554,6 +624,7 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
   }
 
   const player = currentPlayer(state);
+  markMissedDisconnectedTurn(state, player);
   if (player.drawnCardId) {
     delete player.drawnCardId;
     pushLog(state, "draw", `${player.nickname} passed after drawing.`);
@@ -568,6 +639,7 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
 
 export function snapshotFor(state: GameStateInternal, playerId?: string): GameSnapshot {
   const self = playerId ? state.players.find((player) => player.id === playerId) : undefined;
+  const viewerSelf = !self && playerId ? state.viewers.find((viewer) => viewer.id === playerId) : undefined;
   const snapshot: GameSnapshot = {
     seq: state.seq,
     serverNow: Date.now(),
@@ -575,6 +647,7 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
     phase: state.phase,
     settings: state.settings,
     players: sortedPlayers(state).map(toPublicPlayer),
+    viewers: sortedViewers(state),
     direction: state.direction,
     roundNumber: state.roundNumber,
     drawPileCount: state.drawPile.length,
@@ -584,8 +657,16 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
   if (self) {
     snapshot.self = {
       id: self.id,
+      role: "player",
       hand: self.hand,
+      resumeToken: self.resumeToken,
       ...(self.drawnCardId ? { drawnCardId: self.drawnCardId } : {})
+    };
+  } else if (viewerSelf) {
+    snapshot.self = {
+      id: viewerSelf.id,
+      role: viewerSelf.role,
+      hand: []
     };
   }
 
@@ -634,6 +715,44 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
 export function sendEmote(state: GameStateInternal, playerId: string, emoteId: string): void {
   const player = findPlayer(state, playerId);
   pushLog(state, "room", `${player.nickname}: ${emoteText(emoteId)}`);
+}
+
+export function resolveAutomatedTurns(state: GameStateInternal): boolean {
+  let changed = false;
+  const limit = state.players.length + 5;
+
+  for (let count = 0; count < limit; count += 1) {
+    if (state.phase !== "playing" || state.pendingOneCall) {
+      return changed;
+    }
+
+    const now = Date.now();
+    if (state.oneWindow && now <= state.oneWindow.deadline) {
+      return changed;
+    }
+
+    const pending = state.pendingChallenge;
+    if (pending) {
+      const challenger = findPlayer(state, pending.challengerId);
+      if (!challenger.connected && challenger.autoPlay) {
+        resolveChallenge(state, challenger.id, false);
+        changed = true;
+        continue;
+      }
+
+      return changed;
+    }
+
+    const player = currentPlayer(state);
+    if (player.connected || !player.autoPlay) {
+      return changed;
+    }
+
+    autoDrawAndPass(state, player);
+    changed = true;
+  }
+
+  return changed;
 }
 
 function applyOpeningCard(state: GameStateInternal, card: Card): void {
@@ -851,6 +970,10 @@ function sortedPlayers(state: GameStateInternal): PlayerState[] {
   return [...state.players].sort((a, b) => a.seat - b.seat);
 }
 
+function sortedViewers(state: GameStateInternal): ViewerState[] {
+  return [...state.viewers].sort((a, b) => a.nickname.localeCompare(b.nickname));
+}
+
 function toPublicPlayer(player: PlayerState): PublicPlayer {
   return {
     id: player.id,
@@ -862,8 +985,129 @@ function toPublicPlayer(player: PlayerState): PublicPlayer {
     connected: player.connected,
     isHost: player.isHost,
     ready: player.ready,
-    calledOne: player.calledOne
+    calledOne: player.calledOne,
+    autoPlay: player.autoPlay,
+    missedDisconnectedTurns: player.missedDisconnectedTurns
   };
+}
+
+function connectPlayer(state: GameStateInternal, player: PlayerState): void {
+  const wasConnected = player.connected;
+  player.connected = true;
+  player.missedDisconnectedTurns = 0;
+  player.autoPlay = false;
+  assignHost(state);
+  if (!wasConnected) {
+    pushLog(state, "room", `${player.nickname} reconnected.`);
+  }
+}
+
+function promoteWaitingPlayers(state: GameStateInternal): void {
+  if (!state.settings.allowMidGameJoin) {
+    return;
+  }
+
+  const waiting = state.viewers.filter((viewer) => viewer.role === "waiting" && viewer.connected);
+  for (const viewer of waiting) {
+    if (state.players.length >= state.settings.maxPlayers) {
+      return;
+    }
+
+    state.players.push({
+      id: viewer.id,
+      nickname: viewer.nickname,
+      avatarId: viewer.avatarId,
+      seat: nextOpenSeat(state),
+      cardCount: 0,
+      score: 0,
+      connected: true,
+      isHost: false,
+      ready: false,
+      calledOne: false,
+      autoPlay: false,
+      missedDisconnectedTurns: 0,
+      hand: [],
+      resumeToken: createResumeToken(state)
+    });
+    state.viewers = state.viewers.filter((item) => item.id !== viewer.id);
+    pushLog(state, "room", `${viewer.nickname} joined the next round.`);
+  }
+
+  assignHost(state);
+}
+
+function rebindPlayerSession(state: GameStateInternal, oldId: string, newId: string): void {
+  if (oldId === newId) {
+    return;
+  }
+
+  const player = findPlayer(state, oldId);
+  player.id = newId;
+  state.viewers = state.viewers.filter((viewer) => viewer.id !== newId);
+
+  if (state.pendingChallenge?.offenderId === oldId) {
+    state.pendingChallenge.offenderId = newId;
+  }
+
+  if (state.pendingChallenge?.challengerId === oldId) {
+    state.pendingChallenge.challengerId = newId;
+  }
+
+  if (state.oneWindow?.playerId === oldId) {
+    state.oneWindow.playerId = newId;
+  }
+
+  if (state.pendingOneCall?.playerId === oldId) {
+    state.pendingOneCall.playerId = newId;
+  }
+
+  if (state.roundWinnerId === oldId) {
+    state.roundWinnerId = newId;
+  }
+
+  if (state.gameWinnerId === oldId) {
+    state.gameWinnerId = newId;
+  }
+}
+
+function createResumeToken(state: GameStateInternal): string {
+  let token = randomBytes(RESUME_TOKEN_BYTES).toString("base64url");
+  const existing = new Set(state.players.map((player) => player.resumeToken));
+
+  while (existing.has(token)) {
+    token = randomBytes(RESUME_TOKEN_BYTES).toString("base64url");
+  }
+
+  return token;
+}
+
+function markMissedDisconnectedTurn(state: GameStateInternal, player: PlayerState): void {
+  if (player.connected) {
+    return;
+  }
+
+  player.missedDisconnectedTurns += 1;
+  if (!player.autoPlay && player.missedDisconnectedTurns >= AUTO_PLAY_AFTER_MISSED_TURNS) {
+    player.autoPlay = true;
+    pushLog(state, "room", `${player.nickname} is on auto play until they reconnect.`);
+  }
+}
+
+function autoDrawAndPass(state: GameStateInternal, player: PlayerState): void {
+  if (player.drawnCardId) {
+    delete player.drawnCardId;
+    pushLog(state, "draw", `${player.nickname} auto-passed while disconnected.`);
+  } else {
+    drawMany(state, player, 1);
+    delete player.drawnCardId;
+    pushLog(state, "draw", `${player.nickname} auto-drew one card while disconnected.`);
+  }
+
+  advanceTurn(state);
+}
+
+function viewerRoleLabel(role: Exclude<ParticipantRole, "player">): string {
+  return role === "waiting" ? "a waiting player" : "a spectator";
 }
 
 function findPlayer(state: GameStateInternal, id: string): PlayerState {
