@@ -3,6 +3,29 @@ import { z } from "zod";
 export const COLORS = ["red", "yellow", "green", "blue"] as const;
 export type Color = (typeof COLORS)[number];
 
+export const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export const ROOM_CODE_LENGTH = 6;
+export const ROOM_CODE_PATTERN = new RegExp(`^[${ROOM_CODE_ALPHABET}]{${ROOM_CODE_LENGTH}}$`);
+
+export function normalizeRoomCode(code: string): string {
+  return code.trim().toUpperCase();
+}
+
+export const AVATARS = [
+  "sun",
+  "moon",
+  "star",
+  "bolt",
+  "leaf",
+  "wave",
+  "flame",
+  "stone",
+  "comet",
+  "spark",
+  "cloud",
+  "gem"
+] as const;
+
 export const CARD_VALUES = [
   0,
   1,
@@ -168,10 +191,12 @@ export const roomSettingsSchema = z.object({
   modeOptions: z.record(z.string(), z.unknown()).default({})
 });
 
+export const roomCodeSchema = z.string().transform(normalizeRoomCode).pipe(z.string().regex(ROOM_CODE_PATTERN));
+
 export const joinOptionsSchema = z.object({
   nickname: z.string().trim().min(1).max(20),
-  avatarId: z.string().trim().min(1).max(40),
-  reconnectToken: z.string().optional()
+  avatarId: z.enum(AVATARS),
+  reconnectToken: z.string().max(512).optional()
 });
 
 export const playCardSchema = z.object({
@@ -203,21 +228,6 @@ export const emoteSchema = z.object({
 export const createRoomRequestSchema = z.object({
   settings: roomSettingsSchema.partial().optional()
 });
-
-export const AVATARS = [
-  "sun",
-  "moon",
-  "star",
-  "bolt",
-  "leaf",
-  "wave",
-  "flame",
-  "stone",
-  "comet",
-  "spark",
-  "cloud",
-  "gem"
-] as const;
 
 export function mergeRoomSettings(input?: RoomSettingsInput): RoomSettings {
   const parsed = roomSettingsSchema.partial().parse(input ?? {});

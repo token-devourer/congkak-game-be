@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { joinOptionsSchema, roomCodeSchema } from "@congcard/shared";
 import {
   addPlayer,
   createGame,
@@ -25,5 +26,11 @@ describe("room lifecycle", () => {
     expect(state.settings.scoreTarget).toBe(500);
     expect(state.players.some((player) => player.id === "third")).toBe(false);
     expect(state.players.find((player) => player.id === "guest")?.isHost).toBe(true);
+  });
+
+  it("rejects invalid room codes and avatar ids at the protocol boundary", () => {
+    expect(roomCodeSchema.parse("abc234")).toBe("ABC234");
+    expect(() => roomCodeSchema.parse("ABC12!")).toThrow();
+    expect(() => joinOptionsSchema.parse({ nickname: "Player", avatarId: "../../evil" })).toThrow();
   });
 });

@@ -39,9 +39,18 @@ interface GameRoomOptions {
   settings?: unknown;
 }
 
+interface ClientRateBucket {
+  count: number;
+  resetAt: number;
+}
+
+const CLIENT_MESSAGE_WINDOW_MS = 10_000;
+const CLIENT_MESSAGE_LIMIT = 80;
+
 export class GameRoom extends Room {
   maxClients = 10;
   private game!: GameStateInternal;
+  private readonly clientRateBuckets = new Map<string, ClientRateBucket>();
 
   onCreate(options: GameRoomOptions): void {
     const settings = roomSettingsSchema.partial().parse(options.settings ?? {});
@@ -152,6 +161,7 @@ export class GameRoom extends Room {
   }
 
   onLeave(client: Client): void {
+    this.clientRateBuckets.delete(client.sessionId);
     if (this.game.players.some((item) => item.id === client.sessionId)) {
       removePlayer(this.game, client.sessionId);
       this.broadcastState();
@@ -169,6 +179,14 @@ export class GameRoom extends Room {
   }
 
   private safe(client: Client, handler: () => void): void {
+    if (!this.allowClientMessage(client)) {
+      client.send("error", {
+        code: "rate_limited",
+        message: "Too many actions. Slow down."
+      });
+      return;
+    }
+
     try {
       handler();
     } catch (error) {
@@ -179,5 +197,22 @@ export class GameRoom extends Room {
       });
       client.send("state", snapshotFor(this.game, client.sessionId));
     }
+  }
+
+  private allowClientMessage(client: Client): boolean {
+    const now = Date.now();
+    const bucket = this.clientRateBuckets.get(client.sessionId);
+
+    if (!bucket || now >= bucket.resetAt) {
+      this.clientRateBuckets.set(client.sessionId, { count: 1, resetAt: now + CLIENT_MESSAGE_WINDOW_MS });
+      return true;
+    }
+
+    if (bucket.count >= CLIENT_MESSAGE_LIMIT) {
+      return false;
+    }
+
+    bucket.count += 1;
+    return true;
   }
 }
