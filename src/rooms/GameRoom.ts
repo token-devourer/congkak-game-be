@@ -142,7 +142,7 @@ export class GameRoom extends Room {
 
   onJoin(client: Client, options: unknown): void {
     const payload = joinOptionsSchema.parse(options);
-    addPlayer(this.game, client.sessionId, payload.nickname, payload.avatarId);
+    addPlayer(this.game, client.sessionId, payload.nickname, payload.avatarId, payload.clientId);
     this.broadcastState();
   }
 

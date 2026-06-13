@@ -198,7 +198,12 @@ export const roomCodeSchema = z.string().transform(normalizeRoomCode).pipe(z.str
 export const joinOptionsSchema = z.object({
   nickname: z.string().trim().min(1).max(20),
   avatarId: z.enum(AVATARS),
-  reconnectToken: z.string().max(512).optional()
+  reconnectToken: z.string().max(512).optional(),
+  // Stable per-browser identity (persisted in localStorage), independent of the
+  // Colyseus sessionId which is regenerated on every fresh connection. Lets the
+  // server reclaim a player's seat after the reconnection grace window expires,
+  // so an accidental disconnect never strands them behind "already playing".
+  clientId: z.string().min(1).max(128).optional()
 });
 
 export const playCardSchema = z.object({

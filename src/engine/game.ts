@@ -25,6 +25,10 @@ const ONE_CALL_SETTLE_MS = 250;
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
   drawnCardId?: string;
+  // Stable per-browser identity used to reclaim this seat after a reconnect.
+  // Never copied into the public snapshot (see toPublicPlayer), so it stays
+  // private to the server and the owning client's join payload.
+  clientId?: string;
 }
 
 export interface GameStateInternal {
@@ -81,12 +85,61 @@ export function getMode(settings: RoomSettings): GameMode {
   return standardMode;
 }
 
-export function addPlayer(state: GameStateInternal, id: string, nickname: string, avatarId: string): void {
+// Repoint every server-side reference that keyed on a player's old sessionId to
+// the new one. Called when a returning player reclaims their seat with a fresh
+// connection so any in-flight window/challenge stays attached to them.
+function repointPlayerReferences(state: GameStateInternal, oldId: string, newId: string): void {
+  if (state.oneWindow?.playerId === oldId) {
+    state.oneWindow.playerId = newId;
+  }
+  if (state.pendingOneCall?.playerId === oldId) {
+    state.pendingOneCall.playerId = newId;
+  }
+  if (state.pendingChallenge) {
+    if (state.pendingChallenge.offenderId === oldId) {
+      state.pendingChallenge.offenderId = newId;
+    }
+    if (state.pendingChallenge.challengerId === oldId) {
+      state.pendingChallenge.challengerId = newId;
+    }
+  }
+}
+
+export function addPlayer(
+  state: GameStateInternal,
+  id: string,
+  nickname: string,
+  avatarId: string,
+  clientId?: string
+): void {
   const existing = state.players.find((player) => player.id === id);
   if (existing) {
     existing.connected = true;
+    if (clientId) {
+      existing.clientId = clientId;
+    }
     pushLog(state, "room", `${existing.nickname} reconnected.`);
     return;
+  }
+
+  // Reclaim by stable identity: a player who dropped (refresh / tab close /
+  // network blip) returns with a brand-new sessionId after the Colyseus grace
+  // window expired, but the same clientId. Re-seat them onto their existing
+  // record instead of rejecting them as a new joiner. This is the case that
+  // used to fail with "This room is already playing." mid-game, and it also
+  // covers a clean rejoin while still in the lobby.
+  if (clientId) {
+    const reclaimable = state.players.find((player) => player.clientId === clientId && !player.connected);
+    if (reclaimable) {
+      const previousId = reclaimable.id;
+      reclaimable.id = id;
+      reclaimable.connected = true;
+      reclaimable.nickname = nickname;
+      reclaimable.avatarId = avatarId;
+      repointPlayerReferences(state, previousId, id);
+      pushLog(state, "room", `${reclaimable.nickname} reconnected.`);
+      return;
+    }
   }
 
   if (state.phase !== "lobby") {
@@ -109,7 +162,8 @@ export function addPlayer(state: GameStateInternal, id: string, nickname: string
     isHost: state.players.length === 0,
     ready: false,
     calledOne: false,
-    hand: []
+    hand: [],
+    ...(clientId ? { clientId } : {})
   });
   pushLog(state, "room", `${nickname} joined the room.`);
 }
