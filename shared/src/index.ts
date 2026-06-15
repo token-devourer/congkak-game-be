@@ -70,6 +70,9 @@ export interface RoomSettings {
   turnTimeoutSec: number;
   scoreTarget: ScoreTarget;
   allowMidGameJoin: boolean;
+  jumpInEnabled: boolean;
+  stackingEnabled: boolean;
+  deckBoxes: number;
   modeOptions: Record<string, unknown>;
 }
 
@@ -79,6 +82,9 @@ export type RoomSettingsInput = {
   turnTimeoutSec?: RoomSettings["turnTimeoutSec"] | undefined;
   scoreTarget?: RoomSettings["scoreTarget"] | undefined;
   allowMidGameJoin?: RoomSettings["allowMidGameJoin"] | undefined;
+  jumpInEnabled?: RoomSettings["jumpInEnabled"] | undefined;
+  stackingEnabled?: RoomSettings["stackingEnabled"] | undefined;
+  deckBoxes?: RoomSettings["deckBoxes"] | undefined;
   modeOptions?: RoomSettings["modeOptions"] | undefined;
 };
 
@@ -128,6 +134,13 @@ export interface OneWindow {
   callResolvesAt?: number;
 }
 
+export interface PendingStack {
+  kind: "draw2" | "wild4";
+  targetPlayerId: string;
+  totalDraw: number;
+  roundWinnerId?: string;
+}
+
 export interface GameLogEntry {
   seq: number;
   type:
@@ -162,6 +175,7 @@ export interface GameSnapshot {
   currentPlayerId?: string;
   turnDeadline?: number;
   pendingChallenge?: PendingChallenge;
+  pendingStack?: PendingStack;
   oneWindow?: OneWindow;
   roundNumber: number;
   drawPileCount: number;
@@ -187,7 +201,7 @@ export interface TurnContext {
 export interface GameMode {
   id: "standard";
   initialHandSize: number;
-  buildDeck(playerCount: number): Card[];
+  buildDeck(playerCount: number, deckBoxes?: number): Card[];
   isPlayable(card: Card, ctx: TurnContext): boolean;
   scoreHand(hand: Card[]): number;
   allowedOutOfTurnActions(ctx: TurnContext): ActionType[];
@@ -199,6 +213,9 @@ export const DEFAULT_ROOM_SETTINGS: RoomSettings = {
   turnTimeoutSec: 30,
   scoreTarget: 0,
   allowMidGameJoin: true,
+  jumpInEnabled: false,
+  stackingEnabled: false,
+  deckBoxes: 1,
   modeOptions: {}
 };
 
@@ -208,6 +225,9 @@ export const roomSettingsSchema = z.object({
   turnTimeoutSec: z.number().int().min(15).max(60).default(30),
   scoreTarget: z.union([z.literal(0), z.literal(500)]).default(0),
   allowMidGameJoin: z.boolean().default(true),
+  jumpInEnabled: z.boolean().default(false),
+  stackingEnabled: z.boolean().default(false),
+  deckBoxes: z.number().int().min(1).max(6).default(1),
   modeOptions: z.record(z.string(), z.unknown()).default({})
 });
 
@@ -259,6 +279,9 @@ export function mergeRoomSettings(input?: RoomSettingsInput): RoomSettings {
     turnTimeoutSec: parsed.turnTimeoutSec ?? DEFAULT_ROOM_SETTINGS.turnTimeoutSec,
     scoreTarget: parsed.scoreTarget ?? DEFAULT_ROOM_SETTINGS.scoreTarget,
     allowMidGameJoin: parsed.allowMidGameJoin ?? DEFAULT_ROOM_SETTINGS.allowMidGameJoin,
+    jumpInEnabled: parsed.jumpInEnabled ?? DEFAULT_ROOM_SETTINGS.jumpInEnabled,
+    stackingEnabled: parsed.stackingEnabled ?? DEFAULT_ROOM_SETTINGS.stackingEnabled,
+    deckBoxes: parsed.deckBoxes ?? DEFAULT_ROOM_SETTINGS.deckBoxes,
     modeOptions: parsed.modeOptions ?? DEFAULT_ROOM_SETTINGS.modeOptions
   };
 }

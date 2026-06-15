@@ -8,6 +8,7 @@ import type {
   GameSnapshot,
   ParticipantRole,
   PendingChallenge,
+  PendingStack,
   PublicPlayer,
   PublicViewer,
   RoomSettings,
@@ -48,6 +49,7 @@ export interface GameStateInternal {
   currentSeat: number;
   turnDeadline?: number;
   pendingChallenge?: PendingChallenge;
+  pendingStack?: PendingStack;
   oneWindow?: { playerId: string; opensAt: number; deadline: number };
   pendingOneCall?: { playerId: string; resolvesAt: number };
   roundNumber: number;
@@ -156,6 +158,7 @@ export function addPlayer(
     hand: [],
     resumeToken: createResumeToken(state)
   });
+  syncDeckBoxMinimum(state);
   pushLog(state, "room", `${nickname} joined the room.`);
   return "player";
 }
@@ -218,6 +221,10 @@ export function updateSettings(state: GameStateInternal, id: string, input: Room
   const nextSettings = mergeRoomSettings({ ...state.settings, ...input });
   if (nextSettings.maxPlayers < state.players.length) {
     throw new GameError("max_players_too_low", "Max players cannot be lower than the current room size.");
+  }
+
+  if (nextSettings.deckBoxes < requiredDeckBoxes(state.players.length)) {
+    throw new GameError("deck_boxes_too_low", "Deck boxes cannot be lower than the room minimum.");
   }
 
   state.settings = nextSettings;
@@ -313,9 +320,11 @@ export function startRound(state: GameStateInternal): void {
 
   state.phase = "playing";
   state.direction = 1;
-  state.drawPile = mode.buildDeck(activePlayers.length);
+  state.settings.deckBoxes = Math.max(state.settings.deckBoxes, requiredDeckBoxes(activePlayers.length));
+  state.drawPile = mode.buildDeck(activePlayers.length, state.settings.deckBoxes);
   state.discardPile = [];
   delete state.pendingChallenge;
+  delete state.pendingStack;
   delete state.oneWindow;
   delete state.pendingOneCall;
   delete state.roundWinnerId;
@@ -357,10 +366,17 @@ export function playCard(state: GameStateInternal, playerId: string, cardId: str
   ensureNoPendingOneCall(state);
   ensureNoPendingChallenge(state);
   const mode = getMode(state.settings);
-  const player = currentPlayer(state);
+  const current = currentPlayer(state);
+  let player = current.id === playerId ? current : findPlayer(state, playerId);
+  const actingOutOfTurn = current.id !== playerId;
 
-  if (player.id !== playerId) {
+  if (actingOutOfTurn && !canJumpIn(state, player, cardId)) {
     throw new GameError("not_your_turn", "It is not your turn.");
+  }
+
+  if (actingOutOfTurn) {
+    state.currentSeat = player.seat;
+    player = currentPlayer(state);
   }
 
   if (player.drawnCardId && player.drawnCardId !== cardId) {
@@ -380,7 +396,12 @@ export function playCard(state: GameStateInternal, playerId: string, cardId: str
   }
 
   const handBefore = [...player.hand];
-  if (!mode.isPlayable(card, { playerId, activeColor, discardTop, hand: player.hand, playerCount: state.players.length })) {
+  const stacking = state.pendingStack;
+  if (stacking) {
+    if (stacking.targetPlayerId !== player.id || !canStackCard(card, stacking)) {
+      throw new GameError("invalid_card", "Only a matching draw card can be stacked.");
+    }
+  } else if (!mode.isPlayable(card, { playerId, activeColor, discardTop, hand: player.hand, playerCount: state.players.length })) {
     throw new GameError("invalid_card", "That card cannot be played now.");
   }
 
@@ -405,9 +426,13 @@ export function playCard(state: GameStateInternal, playerId: string, cardId: str
 
   updateOneWindowAfterPlay(state, player);
   pushLog(state, "play", `${player.nickname} played ${cardLabel(card)}.`);
-  applyPlayedCard(state, player, card, handBefore);
+  if (stacking) {
+    applyStackedCard(state, player, card);
+  } else {
+    applyPlayedCard(state, player, card, handBefore);
+  }
 
-  if (!state.pendingChallenge && player.hand.length === 0) {
+  if (!state.pendingChallenge && !state.pendingStack && player.hand.length === 0) {
     completeRound(state, player.id);
   }
 }
@@ -428,6 +453,11 @@ export function drawCard(state: GameStateInternal, playerId: string): void {
   }
 
   ensureNoActiveOneWindow(state);
+
+  if (state.pendingStack) {
+    resolveStackDraw(state, player);
+    return;
+  }
 
   const card = takeCard(state);
   if (!card) {
@@ -615,6 +645,13 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
     return false;
   }
 
+  if (state.pendingStack) {
+    const player = currentPlayer(state);
+    markMissedDisconnectedTurn(state, player);
+    resolveStackDraw(state, player);
+    return true;
+  }
+
   const pending = state.pendingChallenge;
   if (pending) {
     // An unanswered Wild Draw Four must not stall the game forever: when the
@@ -704,6 +741,10 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
     snapshot.pendingChallenge = state.pendingChallenge;
   }
 
+  if (state.pendingStack) {
+    snapshot.pendingStack = state.pendingStack;
+  }
+
   if (state.oneWindow) {
     snapshot.oneWindow = {
       ...state.oneWindow,
@@ -742,6 +783,17 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
       return changed;
     }
 
+    const player = currentPlayer(state);
+    if (state.pendingStack) {
+      if (player.connected || !player.autoPlay) {
+        return changed;
+      }
+
+      resolveStackDraw(state, player);
+      changed = true;
+      continue;
+    }
+
     const pending = state.pendingChallenge;
     if (pending) {
       const challenger = findPlayer(state, pending.challengerId);
@@ -754,7 +806,6 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
       return changed;
     }
 
-    const player = currentPlayer(state);
     if (player.connected || !player.autoPlay) {
       return changed;
     }
@@ -797,6 +848,11 @@ function applyPlayedCard(state: GameStateInternal, player: PlayerState, card: Ca
   }
 
   if (card.value === "draw2") {
+    if (state.settings.stackingEnabled) {
+      startStack(state, player, "draw2", 2);
+      return;
+    }
+
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     drawMany(state, target, 2);
     state.currentSeat = seatAfter(state, target.seat);
@@ -806,6 +862,11 @@ function applyPlayedCard(state: GameStateInternal, player: PlayerState, card: Ca
   }
 
   if (card.value === "wild4") {
+    if (state.settings.stackingEnabled) {
+      startStack(state, player, "wild4", 4);
+      return;
+    }
+
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     const previousColor = colorBeforeWild(state);
     state.pendingChallenge = {
@@ -825,6 +886,78 @@ function applyPlayedCard(state: GameStateInternal, player: PlayerState, card: Ca
   }
 
   advanceTurn(state);
+}
+
+function startStack(state: GameStateInternal, player: PlayerState, kind: PendingStack["kind"], amount: number): void {
+  const target = findPlayerBySeat(state, seatAfter(state, player.seat));
+  state.pendingStack = {
+    kind,
+    targetPlayerId: target.id,
+    totalDraw: amount,
+    ...(player.hand.length === 0 ? { roundWinnerId: player.id } : {})
+  };
+  state.currentSeat = target.seat;
+  setTurnDeadline(state);
+  pushLog(state, "draw", `${target.nickname} must stack or draw ${amount} cards.`);
+}
+
+function applyStackedCard(state: GameStateInternal, player: PlayerState, card: Card): void {
+  const stack = state.pendingStack;
+  const amount = stackDrawAmount(card);
+  if (!stack || !amount) {
+    throw new GameError("invalid_card", "Only a matching draw card can be stacked.");
+  }
+
+  const target = findPlayerBySeat(state, seatAfter(state, player.seat));
+  const roundWinnerId = stack.roundWinnerId ?? (player.hand.length === 0 ? player.id : undefined);
+  state.pendingStack = {
+    kind: stack.kind,
+    targetPlayerId: target.id,
+    totalDraw: stack.totalDraw + amount,
+    ...(roundWinnerId ? { roundWinnerId } : {})
+  };
+  state.currentSeat = target.seat;
+  setTurnDeadline(state);
+  pushLog(state, "draw", `${target.nickname} must stack or draw ${stack.totalDraw + amount} cards.`);
+}
+
+function resolveStackDraw(state: GameStateInternal, player: PlayerState): void {
+  const stack = state.pendingStack;
+  if (!stack || stack.targetPlayerId !== player.id) {
+    return;
+  }
+
+  drawMany(state, player, stack.totalDraw);
+  pushLog(state, "draw", `${player.nickname} drew ${stack.totalDraw} stacked cards.`);
+  const winnerId = stack.roundWinnerId;
+  delete state.pendingStack;
+  if (winnerId) {
+    completeRound(state, winnerId);
+    return;
+  }
+
+  state.currentSeat = seatAfter(state, player.seat);
+  setTurnDeadline(state);
+}
+
+function canStackCard(card: Card, stack: PendingStack): boolean {
+  return stack.kind === "draw2" ? card.value === "draw2" : card.value === "wild4";
+}
+
+function stackDrawAmount(card: Card): number | null {
+  if (card.value === "draw2") return 2;
+  if (card.value === "wild4") return 4;
+  return null;
+}
+
+function canJumpIn(state: GameStateInternal, player: PlayerState, cardId: string): boolean {
+  if (!state.settings.jumpInEnabled || state.pendingStack || player.drawnCardId) {
+    return false;
+  }
+
+  const discardTop = topDiscard(state);
+  const card = player.hand.find((item) => item.id === cardId);
+  return Boolean(card && discardTop && card.value === discardTop.value && card.color === discardTop.color);
 }
 
 function updateOneWindowAfterPlay(state: GameStateInternal, player: PlayerState): void {
@@ -859,6 +992,7 @@ function completeRound(state: GameStateInternal, winnerId: string): void {
 
   delete state.turnDeadline;
   delete state.pendingChallenge;
+  delete state.pendingStack;
   delete state.oneWindow;
   delete state.pendingOneCall;
   pushLog(state, "round", `${winner.nickname} won the round with ${score} points.`);
@@ -1066,6 +1200,7 @@ function promoteWaitingPlayers(state: GameStateInternal): void {
     pushLog(state, "room", `${viewer.nickname} joined the next round.`);
   }
 
+  syncDeckBoxMinimum(state);
   assignHost(state);
 }
 
@@ -1112,6 +1247,14 @@ function createResumeToken(state: GameStateInternal): string {
   }
 
   return token;
+}
+
+function requiredDeckBoxes(playerCount: number): number {
+  return Math.max(1, Math.ceil(playerCount / 4));
+}
+
+function syncDeckBoxMinimum(state: GameStateInternal): void {
+  state.settings.deckBoxes = Math.max(state.settings.deckBoxes, requiredDeckBoxes(state.players.length));
 }
 
 function markMissedDisconnectedTurn(state: GameStateInternal, player: PlayerState): void {

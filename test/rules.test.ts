@@ -497,6 +497,67 @@ describe("standard mode", () => {
     expect(state.settings.maxPlayers).toBe(4);
   });
 
+  it("keeps deck boxes at the current lobby minimum", () => {
+    const state = createGame("ABC123", { maxPlayers: 6 });
+    addPlayer(state, "p1", "Ava", "sun");
+    addPlayer(state, "p2", "Ben", "moon");
+    addPlayer(state, "p3", "Cy", "star");
+    addPlayer(state, "p4", "Di", "bolt");
+    addPlayer(state, "p5", "Eli", "leaf");
+
+    expect(state.settings.deckBoxes).toBe(2);
+    expect(() => updateSettings(state, "p1", { deckBoxes: 1 })).toThrow("room minimum");
+
+    for (const player of state.players) {
+      if (!player.isHost) {
+        setReady(state, player.id, true);
+      }
+    }
+
+    startRound(state);
+
+    expect(state.drawPile).toHaveLength(180);
+  });
+
+  it("allows jump in with an exact matching card when enabled", () => {
+    const state = controlledGame3();
+    state.settings.jumpInEnabled = true;
+    state.players[0]!.hand = [card("p1-red-5", "red", 5), card("p1-blue-1", "blue", 1), card("p1-green-2", "green", 2)];
+    state.players[1]!.hand = [card("p2-yellow-7", "yellow", 7)];
+    state.players[2]!.hand = [card("p3-red-5", "red", 5), card("p3-blue-9", "blue", 9)];
+
+    playCard(state, "p1", "p1-red-5");
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+
+    playCard(state, "p3", "p3-red-5");
+
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
+  it("stacks draw cards until the target draws the total", () => {
+    const state = controlledGame3();
+    state.settings.stackingEnabled = true;
+    state.players[0]!.hand = [card("p1-red-draw2", "red", "draw2"), card("p1-blue-1", "blue", 1), card("p1-green-2", "green", 2)];
+    state.players[1]!.hand = [card("p2-blue-draw2", "blue", "draw2"), card("p2-yellow-7", "yellow", 7)];
+    state.players[2]!.hand = [card("p3-green-8", "green", 8)];
+
+    playCard(state, "p1", "p1-red-draw2");
+    expect(state.pendingStack).toMatchObject({ kind: "draw2", targetPlayerId: "p2", totalDraw: 2 });
+
+    playCard(state, "p2", "p2-blue-draw2");
+    expect(state.pendingStack).toMatchObject({ kind: "draw2", targetPlayerId: "p3", totalDraw: 4 });
+
+    callOne(state, "p2");
+    state.pendingOneCall!.resolvesAt = Date.now() - 1;
+    expect(resolvePendingOneCall(state)).toBe(true);
+
+    drawCard(state, "p3");
+
+    expect(state.pendingStack).toBeUndefined();
+    expect(state.players[2]!.hand).toHaveLength(5);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
   it("plays a deterministic action-card sequence without stale One/Catch state", () => {
     const state = controlledGame3();
     state.players[0]!.hand = [card("p1-red-1", "red", 1), card("p1-green-1", "green", 1)];

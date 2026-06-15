@@ -59,8 +59,8 @@ export function buildSingleDeck(deckIndex: number): Card[] {
 export const standardMode: GameMode = {
   id: "standard",
   initialHandSize: 7,
-  buildDeck(playerCount) {
-    const deckCount = playerCount > 10 ? 2 : 1;
+  buildDeck(_playerCount, deckBoxes) {
+    const deckCount = deckBoxes ?? 1;
     const decks: Card[] = [];
 
     for (let deckIndex = 0; deckIndex < deckCount; deckIndex += 1) {
