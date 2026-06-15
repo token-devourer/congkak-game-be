@@ -388,6 +388,8 @@ export function playCard(state: GameStateInternal, playerId: string, cardId: str
     throw new GameError("color_required", "Choose a color for this Wild card.");
   }
 
+  closeOneWindowBeforeTurnAction(state);
+
   player.hand.splice(cardIndex, 1);
   player.cardCount = player.hand.length;
   delete player.drawnCardId;
@@ -424,6 +426,8 @@ export function drawCard(state: GameStateInternal, playerId: string): void {
   if (player.drawnCardId) {
     throw new GameError("already_drew", "You already drew a card this turn.");
   }
+
+  closeOneWindowBeforeTurnAction(state);
 
   const card = takeCard(state);
   if (!card) {
@@ -463,6 +467,8 @@ export function playDrawn(state: GameStateInternal, playerId: string, play: bool
     playCard(state, playerId, player.drawnCardId, declaredColor);
     return;
   }
+
+  closeOneWindowBeforeTurnAction(state);
 
   delete player.drawnCardId;
   pushLog(state, "draw", `${player.nickname} passed after drawing.`);
@@ -564,6 +570,8 @@ export function resolveChallenge(state: GameStateInternal, playerId: string, acc
     throw new GameError("not_challenger", "Only the affected player can resolve this challenge.");
   }
 
+  closeOneWindowBeforeTurnAction(state);
+
   const offender = findPlayer(state, pending.offenderId);
   const challenger = findPlayer(state, pending.challengerId);
   delete state.pendingChallenge;
@@ -605,6 +613,7 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
 
   const pending = state.pendingChallenge;
   if (pending) {
+    closeOneWindowBeforeTurnAction(state);
     // An unanswered Wild Draw Four must not stall the game forever: when the
     // turn timer lapses, resolve it as if the challenger declined.
     const challenger = findPlayer(state, pending.challengerId);
@@ -624,6 +633,7 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
   }
 
   const player = currentPlayer(state);
+  closeOneWindowBeforeTurnAction(state);
   markMissedDisconnectedTurn(state, player);
   if (player.drawnCardId) {
     delete player.drawnCardId;
@@ -726,15 +736,11 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
       return changed;
     }
 
-    const now = Date.now();
-    if (state.oneWindow && now <= state.oneWindow.deadline) {
-      return changed;
-    }
-
     const pending = state.pendingChallenge;
     if (pending) {
       const challenger = findPlayer(state, pending.challengerId);
       if (!challenger.connected && challenger.autoPlay) {
+        closeOneWindowBeforeTurnAction(state);
         resolveChallenge(state, challenger.id, false);
         changed = true;
         continue;
@@ -748,6 +754,7 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
       return changed;
     }
 
+    closeOneWindowBeforeTurnAction(state);
     autoDrawAndPass(state, player);
     changed = true;
   }
@@ -879,6 +886,15 @@ function closeOneWindowForPlayer(state: GameStateInternal, playerId: string): vo
   if (state.pendingOneCall?.playerId === playerId) {
     delete state.pendingOneCall;
   }
+}
+
+function closeOneWindowBeforeTurnAction(state: GameStateInternal): void {
+  const active = state.oneWindow;
+  if (!active || state.pendingOneCall) {
+    return;
+  }
+
+  closeOneWindowForPlayer(state, active.playerId);
 }
 
 function syncPlayerHandChange(state: GameStateInternal, player: PlayerState): void {
