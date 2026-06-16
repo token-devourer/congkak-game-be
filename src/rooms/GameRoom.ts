@@ -7,7 +7,8 @@ import {
   kickSchema,
   playCardSchema,
   playDrawnSchema,
-  roomSettingsSchema
+  roomSettingsSchema,
+  setAwaySchema
 } from "@congcard/shared";
 import { config } from "../config.js";
 import {
@@ -28,6 +29,7 @@ import {
   resolvePendingOneCall,
   sendEmote,
   setPlayerConnected,
+  setPlayerAway,
   setReady,
   snapshotFor,
   startRound,
@@ -83,6 +85,12 @@ export class GameRoom extends Room {
       const settingsUpdate = roomSettingsSchema.partial().parse(message ?? {});
       updateSettings(this.game, client.sessionId, settingsUpdate);
       this.maxClients = Math.max(40, this.game.settings.maxPlayers + 20);
+      this.broadcastState();
+    }));
+
+    this.onMessage("room.setAway", (client, message) => this.safe(client, () => {
+      const payload = setAwaySchema.parse(message ?? {});
+      setPlayerAway(this.game, client.sessionId, payload.away);
       this.broadcastState();
     }));
 

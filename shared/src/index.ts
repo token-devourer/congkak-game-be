@@ -72,6 +72,7 @@ export interface RoomSettings {
   allowMidGameJoin: boolean;
   jumpInEnabled: boolean;
   stackingEnabled: boolean;
+  challengeEnabled: boolean;
   deckBoxes: number;
   modeOptions: Record<string, unknown>;
 }
@@ -84,6 +85,7 @@ export type RoomSettingsInput = {
   allowMidGameJoin?: RoomSettings["allowMidGameJoin"] | undefined;
   jumpInEnabled?: RoomSettings["jumpInEnabled"] | undefined;
   stackingEnabled?: RoomSettings["stackingEnabled"] | undefined;
+  challengeEnabled?: RoomSettings["challengeEnabled"] | undefined;
   deckBoxes?: RoomSettings["deckBoxes"] | undefined;
   modeOptions?: RoomSettings["modeOptions"] | undefined;
 };
@@ -96,6 +98,7 @@ export interface PublicPlayer {
   cardCount: number;
   score: number;
   connected: boolean;
+  away: boolean;
   isHost: boolean;
   ready: boolean;
   calledOne: boolean;
@@ -224,6 +227,7 @@ export const DEFAULT_ROOM_SETTINGS: RoomSettings = {
   allowMidGameJoin: true,
   jumpInEnabled: false,
   stackingEnabled: false,
+  challengeEnabled: true,
   deckBoxes: 1,
   modeOptions: {}
 };
@@ -236,6 +240,7 @@ export const roomSettingsSchema = z.object({
   allowMidGameJoin: z.boolean().default(true),
   jumpInEnabled: z.boolean().default(false),
   stackingEnabled: z.boolean().default(false),
+  challengeEnabled: z.boolean().default(true),
   deckBoxes: z.number().int().min(1).max(6).default(1),
   modeOptions: z.record(z.string(), z.unknown()).default({})
 });
@@ -267,6 +272,10 @@ export const challengeSchema = z.object({
   accept: z.boolean()
 });
 
+export const setAwaySchema = z.object({
+  away: z.boolean()
+});
+
 export const kickSchema = z.object({
   playerId: z.string().min(1)
 });
@@ -290,6 +299,7 @@ export function mergeRoomSettings(input?: RoomSettingsInput): RoomSettings {
     allowMidGameJoin: parsed.allowMidGameJoin ?? DEFAULT_ROOM_SETTINGS.allowMidGameJoin,
     jumpInEnabled: parsed.jumpInEnabled ?? DEFAULT_ROOM_SETTINGS.jumpInEnabled,
     stackingEnabled: parsed.stackingEnabled ?? DEFAULT_ROOM_SETTINGS.stackingEnabled,
+    challengeEnabled: parsed.challengeEnabled ?? DEFAULT_ROOM_SETTINGS.challengeEnabled,
     deckBoxes: parsed.deckBoxes ?? DEFAULT_ROOM_SETTINGS.deckBoxes,
     modeOptions: parsed.modeOptions ?? DEFAULT_ROOM_SETTINGS.modeOptions
   };

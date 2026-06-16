@@ -152,6 +152,7 @@ export function addPlayer(
     cardCount: 0,
     score: 0,
     connected: true,
+    away: false,
     isHost: state.players.length === 0,
     ready: false,
     calledOne: false,
@@ -176,12 +177,31 @@ export function setPlayerConnected(state: GameStateInternal, id: string, connect
   const player = findPlayer(state, id);
   if (!connected) {
     player.connected = false;
+    player.away = false;
     player.ready = false;
     pushLog(state, "room", `${player.nickname} disconnected.`);
     assignHost(state);
   } else {
     connectPlayer(state, player);
   }
+}
+
+export function setPlayerAway(state: GameStateInternal, id: string, away: boolean): void {
+  const player = findPlayer(state, id);
+  if (!player.connected) {
+    throw new GameError("player_disconnected", "You must be connected to change away status.");
+  }
+
+  if (player.away === away) {
+    return;
+  }
+
+  player.away = away;
+  player.ready = away ? false : player.ready;
+  player.missedDisconnectedTurns = 0;
+  player.autoPlay = away;
+  pushLog(state, "room", away ? `${player.nickname} is away.` : `${player.nickname} returned to the table.`);
+  assignHost(state);
 }
 
 export function removePlayer(state: GameStateInternal, id: string): void {
@@ -197,6 +217,7 @@ export function removePlayer(state: GameStateInternal, id: string): void {
     state.players = state.players.filter((item) => item.id !== id);
   } else {
     player.connected = false;
+    player.away = false;
     player.ready = false;
   }
 
@@ -206,12 +227,14 @@ export function removePlayer(state: GameStateInternal, id: string): void {
 
 export function setReady(state: GameStateInternal, id: string, ready: boolean): void {
   const player = findPlayer(state, id);
+  ensurePlayerInteractive(player);
   player.ready = ready;
   pushLog(state, "room", `${player.nickname} is ${ready ? "ready" : "not ready"}.`);
 }
 
 export function updateSettings(state: GameStateInternal, id: string, input: RoomSettingsInput): void {
   const player = findPlayer(state, id);
+  ensurePlayerInteractive(player);
   if (!player.isHost) {
     throw new GameError("not_host", "Only the host can change room settings.");
   }
@@ -235,6 +258,7 @@ export function updateSettings(state: GameStateInternal, id: string, input: Room
 
 export function kickPlayer(state: GameStateInternal, hostId: string, targetId: string): void {
   const host = findPlayer(state, hostId);
+  ensurePlayerInteractive(host);
   if (!host.isHost) {
     throw new GameError("not_host", "Only the host can kick players.");
   }
@@ -382,6 +406,7 @@ export function playCard(state: GameStateInternal, playerId: string, cardId: str
   const current = currentPlayer(state);
   let player = current.id === playerId ? current : findPlayer(state, playerId);
   const actingOutOfTurn = current.id !== playerId;
+  ensurePlayerInteractive(player);
 
   if (actingOutOfTurn && !canJumpIn(state, player, cardId)) {
     throw new GameError("not_your_turn", "It is not your turn.");
@@ -463,6 +488,8 @@ export function drawCard(state: GameStateInternal, playerId: string): void {
     throw new GameError("not_your_turn", "It is not your turn.");
   }
 
+  ensurePlayerInteractive(player);
+
   if (player.drawnCardId) {
     throw new GameError("already_drew", "You already drew a card this turn.");
   }
@@ -509,6 +536,8 @@ export function playDrawn(state: GameStateInternal, playerId: string, play: bool
     throw new GameError("not_your_turn", "It is not your turn.");
   }
 
+  ensurePlayerInteractive(player);
+
   if (!player.drawnCardId) {
     throw new GameError("no_drawn_card", "There is no drawn card to resolve.");
   }
@@ -528,6 +557,7 @@ export function playDrawn(state: GameStateInternal, playerId: string, play: bool
 export function callOne(state: GameStateInternal, playerId: string): void {
   ensurePlaying(state);
   const player = findPlayer(state, playerId);
+  ensurePlayerInteractive(player);
   const oneWindow = state.oneWindow;
   const now = Date.now();
 
@@ -558,6 +588,7 @@ export function callOne(state: GameStateInternal, playerId: string): void {
 export function catchOne(state: GameStateInternal, catcherId: string, targetId: string): void {
   ensurePlaying(state);
   const catcher = findPlayer(state, catcherId);
+  ensurePlayerInteractive(catcher);
   const target = findPlayer(state, targetId);
   const oneWindow = state.oneWindow;
   const pendingCall = state.pendingOneCall?.playerId === targetId;
@@ -613,7 +644,7 @@ export function expireOneWindow(state: GameStateInternal): boolean {
   return true;
 }
 
-export function resolveChallenge(state: GameStateInternal, playerId: string, accept: boolean): void {
+export function resolveChallenge(state: GameStateInternal, playerId: string, accept: boolean, automated = false): void {
   ensurePlaying(state);
   ensureNoPendingOneCall(state);
   const pending = state.pendingChallenge;
@@ -629,6 +660,9 @@ export function resolveChallenge(state: GameStateInternal, playerId: string, acc
 
   const offender = findPlayer(state, pending.offenderId);
   const challenger = findPlayer(state, pending.challengerId);
+  if (!automated) {
+    ensurePlayerInteractive(challenger);
+  }
   delete state.pendingChallenge;
 
   if (!accept) {
@@ -795,6 +829,7 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
 
 export function sendEmote(state: GameStateInternal, playerId: string, emoteId: string): void {
   const player = findPlayer(state, playerId);
+  ensurePlayerInteractive(player);
   pushLog(state, "room", `${player.nickname}: ${emoteText(emoteId)}`);
 }
 
@@ -818,7 +853,7 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
         continue;
       }
 
-      if (player.connected || !player.autoPlay) {
+      if (!isAutoControllable(player)) {
         return changed;
       }
 
@@ -830,8 +865,8 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
     const pending = state.pendingChallenge;
     if (pending) {
       const challenger = findPlayer(state, pending.challengerId);
-      if (!challenger.connected && challenger.autoPlay) {
-        resolveChallenge(state, challenger.id, false);
+      if (isAutoControllable(challenger)) {
+        resolveChallenge(state, challenger.id, false, true);
         changed = true;
         continue;
       }
@@ -839,7 +874,7 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
       return changed;
     }
 
-    if (player.connected || !player.autoPlay) {
+    if (!isAutoControllable(player)) {
       return changed;
     }
 
@@ -902,6 +937,14 @@ function applyPlayedCard(state: GameStateInternal, player: PlayerState, card: Ca
 
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     const previousColor = colorBeforeWild(state);
+    if (!state.settings.challengeEnabled) {
+      drawMany(state, target, 4);
+      state.currentSeat = seatAfter(state, target.seat);
+      setTurnDeadline(state);
+      pushLog(state, "challenge", `${target.nickname} took four cards.`);
+      return;
+    }
+
     state.pendingChallenge = {
       offenderId: player.id,
       challengerId: target.id,
@@ -1325,6 +1368,7 @@ function toPublicPlayer(player: PlayerState): PublicPlayer {
     cardCount: player.hand.length,
     score: player.score,
     connected: player.connected,
+    away: player.away,
     isHost: player.isHost,
     ready: player.ready,
     calledOne: player.calledOne,
@@ -1337,6 +1381,7 @@ function toPublicPlayer(player: PlayerState): PublicPlayer {
 function connectPlayer(state: GameStateInternal, player: PlayerState): void {
   const wasConnected = player.connected;
   player.connected = true;
+  player.away = false;
   player.missedDisconnectedTurns = 0;
   player.autoPlay = false;
   assignHost(state);
@@ -1364,6 +1409,7 @@ function promoteWaitingPlayers(state: GameStateInternal): void {
       cardCount: 0,
       score: 0,
       connected: true,
+      away: false,
       isHost: false,
       ready: false,
       calledOne: false,
@@ -1459,6 +1505,10 @@ function markMissedDisconnectedTurn(state: GameStateInternal, player: PlayerStat
   }
 }
 
+function isAutoControllable(player: PlayerState): boolean {
+  return player.autoPlay && !player.finishedRank && (!player.connected || player.away);
+}
+
 function autoDrawAndPass(state: GameStateInternal, player: PlayerState): void {
   if (player.finishedRank) {
     advanceTurn(state);
@@ -1467,14 +1517,18 @@ function autoDrawAndPass(state: GameStateInternal, player: PlayerState): void {
 
   if (player.drawnCardId) {
     delete player.drawnCardId;
-    pushLog(state, "draw", `${player.nickname} auto-passed while disconnected.`);
+    pushLog(state, "draw", `${player.nickname} auto-passed ${autoPlayReason(player)}.`);
   } else {
     drawMany(state, player, 1);
     delete player.drawnCardId;
-    pushLog(state, "draw", `${player.nickname} auto-drew one card while disconnected.`);
+    pushLog(state, "draw", `${player.nickname} auto-drew one card ${autoPlayReason(player)}.`);
   }
 
   advanceTurn(state);
+}
+
+function autoPlayReason(player: PlayerState): string {
+  return player.away ? "while away" : "while disconnected";
 }
 
 function viewerRoleLabel(role: Exclude<ParticipantRole, "player">): string {
@@ -1510,7 +1564,7 @@ function currentPlayer(state: GameStateInternal): PlayerState {
 }
 
 function assignHost(state: GameStateInternal): void {
-  if (state.players.some((player) => player.isHost && player.connected)) {
+  if (state.players.some((player) => player.isHost && player.connected && !player.away)) {
     return;
   }
 
@@ -1518,7 +1572,7 @@ function assignHost(state: GameStateInternal): void {
     player.isHost = false;
   }
 
-  const nextHost = state.players.find((player) => player.connected) ?? state.players[0];
+  const nextHost = state.players.find((player) => player.connected && !player.away) ?? state.players.find((player) => player.connected) ?? state.players[0];
   if (nextHost) {
     nextHost.isHost = true;
     pushLog(state, "room", `${nextHost.nickname} is now the host.`);
@@ -1573,6 +1627,12 @@ function ensurePlaying(state: GameStateInternal): void {
 function ensurePlayerInRound(player: PlayerState): void {
   if (player.finishedRank) {
     throw new GameError("round_finished", "You have already finished this round.");
+  }
+}
+
+function ensurePlayerInteractive(player: PlayerState): void {
+  if (!player.connected || player.away) {
+    throw new GameError("player_away", "You are away from the table.");
   }
 }
 

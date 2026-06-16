@@ -13,6 +13,7 @@ import {
   resolveAutomatedTurns,
   resolveChallenge,
   resolvePendingOneCall,
+  setPlayerAway,
   setPlayerConnected,
   setReady,
   snapshotFor,
@@ -432,6 +433,48 @@ describe("standard mode", () => {
     state.currentSeat = 1;
 
     expect(resolveAutomatedTurns(state)).toBe(true);
+
+    expect(state.pendingChallenge).toBeUndefined();
+    expect(state.players[1]!.hand).toHaveLength(5);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
+  it("auto plays immediately for away players while keeping them connected", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-9", "red", 9)];
+    setPlayerAway(state, "p1", true);
+
+    expect(state.players[0]!).toMatchObject({ connected: true, away: true, autoPlay: true });
+    expect(resolveAutomatedTurns(state)).toBe(true);
+    expect(state.players[0]!.hand).toHaveLength(2);
+    expect(snapshotFor(state).currentPlayerId).toBe("p2");
+
+    setPlayerAway(state, "p1", false);
+    expect(state.players[0]!).toMatchObject({ away: false, autoPlay: false, missedDisconnectedTurns: 0 });
+  });
+
+  it("auto-accepts an away challenge turn", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-9", "red", 9)];
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+    setPlayerAway(state, "p2", true);
+    state.pendingChallenge = { offenderId: "p1", challengerId: "p2", declaredColor: "blue", guilty: false };
+    state.currentSeat = 1;
+
+    expect(resolveAutomatedTurns(state)).toBe(true);
+
+    expect(state.pendingChallenge).toBeUndefined();
+    expect(state.players[1]!.hand).toHaveLength(5);
+    expect(snapshotFor(state).currentPlayerId).toBe("p1");
+  });
+
+  it("resolves Wild Draw Four without challenge when disabled", () => {
+    const state = controlledGame();
+    state.settings.challengeEnabled = false;
+    state.players[0]!.hand = [card("wild4", null, "wild4"), card("red-9", "red", 9)];
+    state.players[1]!.hand = [card("blue-8", "blue", 8)];
+
+    playCard(state, "p1", "wild4", "green");
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(5);
