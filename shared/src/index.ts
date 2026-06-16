@@ -74,6 +74,7 @@ export interface RoomSettings {
   jumpInEnabled: boolean;
   stackingEnabled: boolean;
   challengeEnabled: boolean;
+  callEnabled: boolean;
   deckBoxes: number;
   modeOptions: Record<string, unknown>;
 }
@@ -87,6 +88,7 @@ export type RoomSettingsInput = {
   jumpInEnabled?: RoomSettings["jumpInEnabled"] | undefined;
   stackingEnabled?: RoomSettings["stackingEnabled"] | undefined;
   challengeEnabled?: RoomSettings["challengeEnabled"] | undefined;
+  callEnabled?: RoomSettings["callEnabled"] | undefined;
   deckBoxes?: RoomSettings["deckBoxes"] | undefined;
   modeOptions?: RoomSettings["modeOptions"] | undefined;
 };
@@ -235,6 +237,7 @@ export const DEFAULT_ROOM_SETTINGS: RoomSettings = {
   jumpInEnabled: false,
   stackingEnabled: false,
   challengeEnabled: true,
+  callEnabled: true,
   deckBoxes: 1,
   modeOptions: {}
 };
@@ -248,6 +251,7 @@ export const roomSettingsSchema = z.object({
   jumpInEnabled: z.boolean().default(false),
   stackingEnabled: z.boolean().default(false),
   challengeEnabled: z.boolean().default(true),
+  callEnabled: z.boolean().default(true),
   deckBoxes: z.number().int().min(1).max(6).default(1),
   modeOptions: z.record(z.string(), z.unknown()).default({})
 });
@@ -261,6 +265,7 @@ export const roomSettingsUpdateSchema = z.object({
   jumpInEnabled: z.boolean().optional(),
   stackingEnabled: z.boolean().optional(),
   challengeEnabled: z.boolean().optional(),
+  callEnabled: z.boolean().optional(),
   deckBoxes: z.number().int().min(1).max(6).optional(),
   modeOptions: z.record(z.string(), z.unknown()).optional()
 });
@@ -310,16 +315,18 @@ export const createRoomRequestSchema = z.object({
 
 export function mergeRoomSettings(input?: RoomSettingsInput): RoomSettings {
   const parsed = roomSettingsUpdateSchema.parse(input ?? {});
+  const scoreTarget = parsed.scoreTarget ?? DEFAULT_ROOM_SETTINGS.scoreTarget;
 
   return {
     modeId: parsed.modeId ?? DEFAULT_ROOM_SETTINGS.modeId,
     maxPlayers: parsed.maxPlayers ?? DEFAULT_ROOM_SETTINGS.maxPlayers,
     turnTimeoutSec: parsed.turnTimeoutSec ?? DEFAULT_ROOM_SETTINGS.turnTimeoutSec,
-    scoreTarget: parsed.scoreTarget ?? DEFAULT_ROOM_SETTINGS.scoreTarget,
+    scoreTarget,
     allowMidGameJoin: parsed.allowMidGameJoin ?? DEFAULT_ROOM_SETTINGS.allowMidGameJoin,
     jumpInEnabled: parsed.jumpInEnabled ?? DEFAULT_ROOM_SETTINGS.jumpInEnabled,
     stackingEnabled: parsed.stackingEnabled ?? DEFAULT_ROOM_SETTINGS.stackingEnabled,
     challengeEnabled: parsed.challengeEnabled ?? DEFAULT_ROOM_SETTINGS.challengeEnabled,
+    callEnabled: parsed.callEnabled ?? (scoreTarget === "lastStand" ? false : DEFAULT_ROOM_SETTINGS.callEnabled),
     deckBoxes: parsed.deckBoxes ?? DEFAULT_ROOM_SETTINGS.deckBoxes,
     modeOptions: parsed.modeOptions ?? DEFAULT_ROOM_SETTINGS.modeOptions
   };

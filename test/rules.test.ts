@@ -222,6 +222,17 @@ describe("standard mode", () => {
     expect(state.pendingOneCall?.playerId).toBe("p1");
   });
 
+  it("does not open the One window when calls are disabled", () => {
+    const state = controlledGame();
+    state.settings.callEnabled = false;
+    state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
+
+    playCard(state, "p1", "red-1");
+
+    expect(state.oneWindow).toBeUndefined();
+    expect(state.players[0]!.calledOne).toBe(false);
+  });
+
   it("opens the catch window after a ping-based network delay", () => {
     const state = controlledGame();
     state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];

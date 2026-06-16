@@ -249,7 +249,11 @@ export function updateSettings(state: GameStateInternal, id: string, input: Room
     throw new GameError("settings_locked", "Room settings are locked after the game starts.");
   }
 
-  const nextSettings = mergeRoomSettings({ ...state.settings, ...input });
+  const scoreTargetDefault =
+    input.scoreTarget !== undefined && input.callEnabled === undefined
+      ? { callEnabled: input.scoreTarget !== "lastStand" }
+      : {};
+  const nextSettings = mergeRoomSettings({ ...state.settings, ...scoreTargetDefault, ...input });
   if (nextSettings.maxPlayers < state.players.length) {
     throw new GameError("max_players_too_low", "Max players cannot be lower than the current room size.");
   }
@@ -1167,6 +1171,12 @@ function canJumpIn(state: GameStateInternal, player: PlayerState, cardId: string
 }
 
 function updateOneWindowAfterPlay(state: GameStateInternal, player: PlayerState): void {
+  if (!state.settings.callEnabled) {
+    player.calledOne = false;
+    closeOneWindowForPlayer(state, player.id);
+    return;
+  }
+
   if (player.finishedRank) {
     closeOneWindowForPlayer(state, player.id);
     return;

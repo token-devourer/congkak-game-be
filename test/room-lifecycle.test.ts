@@ -44,6 +44,20 @@ describe("room lifecycle", () => {
     expect(state.settings.challengeEnabled).toBe(true);
   });
 
+  it("defaults One and Catch off for Last Stand and back on for normal scoring", () => {
+    const state = createGame("ROOM45");
+    addPlayer(state, "host", "Host", "sun");
+    addPlayer(state, "guest", "Guest", "moon");
+
+    updateSettings(state, "host", { scoreTarget: "lastStand" });
+    expect(state.settings.scoreTarget).toBe("lastStand");
+    expect(state.settings.callEnabled).toBe(false);
+
+    updateSettings(state, "host", { scoreTarget: 0 });
+    expect(state.settings.scoreTarget).toBe(0);
+    expect(state.settings.callEnabled).toBe(true);
+  });
+
   it("rejects invalid room codes and avatar ids at the protocol boundary", () => {
     expect(roomCodeSchema.parse("abc234")).toBe("ABC234");
     expect(() => roomCodeSchema.parse("ABC12!")).toThrow();
