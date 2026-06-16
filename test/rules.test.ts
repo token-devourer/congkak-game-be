@@ -106,6 +106,8 @@ describe("standard mode", () => {
     playCard(state, "p1", "wild4", "blue");
     expect(state.pendingChallenge?.guilty).toBe(true);
 
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
     callOne(state, "p1");
     state.pendingOneCall!.resolvesAt = Date.now() - 1;
     expect(resolvePendingOneCall(state)).toBe(true);
@@ -205,24 +207,30 @@ describe("standard mode", () => {
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
   });
 
-  it("opens the One window immediately with no pre-buffer", () => {
+  it("opens the One window after a ping-based network delay", () => {
     const state = controlledGame();
     state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
 
     playCard(state, "p1", "red-1");
 
-    // No "ready in" delay: the window is actionable the instant it opens.
-    expect(state.oneWindow!.opensAt).toBeLessThanOrEqual(Date.now());
+    // The window now opens after a dynamic delay (MIN_ONE_DELAY_MS at minimum)
+    // so every client has fair time to receive the snapshot.
+    expect(state.oneWindow!.opensAt).toBeGreaterThan(Date.now() + 150);
+    // Fast-forward past the buffer:
+    state.oneWindow!.opensAt = Date.now() - 1;
     expect(() => callOne(state, "p1")).not.toThrow();
     expect(state.pendingOneCall?.playerId).toBe("p1");
   });
 
-  it("opens the catch window immediately with no pre-buffer", () => {
+  it("opens the catch window after a ping-based network delay", () => {
     const state = controlledGame();
     state.players[0]!.hand = [card("red-1", "red", 1), card("blue-2", "blue", 2)];
 
     playCard(state, "p1", "red-1");
 
+    // The window is not immediately actionable; fast-forward past the delay:
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
     expect(() => catchOne(state, "p2", "p1")).not.toThrow();
     expect(state.players[0]!.hand).toHaveLength(3);
     expect(state.oneWindow).toBeUndefined();
@@ -721,6 +729,8 @@ describe("standard mode", () => {
     playCard(state, "p2", "p2-blue-draw2");
     expect(state.pendingStack).toMatchObject({ kind: "draw2", targetPlayerId: "p3", totalDraw: 4 });
 
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
     callOne(state, "p2");
     state.pendingOneCall!.resolvesAt = Date.now() - 1;
     expect(resolvePendingOneCall(state)).toBe(true);
@@ -894,6 +904,8 @@ describe("standard mode", () => {
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
     expect(state.oneWindow?.playerId).toBe("p1");
 
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
     catchOne(state, "p2", "p1");
     expect(state.players[0]!.hand.map((item) => item.id)).toContain("p1-catch-red-7");
     expect(state.oneWindow).toBeUndefined();
@@ -911,6 +923,8 @@ describe("standard mode", () => {
     expect(state.oneWindow?.playerId).toBe("p2");
 
     expect(() => resolveChallenge(state, "p3", true)).toThrow("One window");
+    state.oneWindow!.opensAt = Date.now() - 1;
+    state.oneWindow!.deadline = Date.now() + 1000;
     callOne(state, "p2");
     state.pendingOneCall!.resolvesAt = Date.now() - 1;
     expect(resolvePendingOneCall(state)).toBe(true);

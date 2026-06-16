@@ -19,12 +19,12 @@ import type {
 import { COLORS, mergeRoomSettings } from "@congcard/shared";
 import { standardMode, shuffleCards, buildSingleDeck } from "./modes/standard.js";
 
-// No pre-buffer: the One/Catch window opens the instant a player hits one card,
-// so the button is actionable immediately. The challenge now comes from the
-// button popping up at a random screen edge (see FE UnoButton) rather than from
-// a "ready in" delay. The window still expires silently after WINDOW_MS so the
-// round keeps moving; the client just no longer renders a countdown for it.
-const ONE_CALL_DELAY_MS = 0;
+// Network-delay buffer so the One/Catch window opens AFTER every player has had
+// a fair chance to receive the snapshot. The delay is calculated dynamically from
+// the highest ping among active players (see updateOneWindowAfterPlay). These
+// constants anchor the floor and the steady-state window length.
+const MIN_ONE_DELAY_MS = 200;
+const ONE_DELAY_EXTRA_MS = 150;
 const ONE_CALL_WINDOW_MS = 4000;
 const ONE_CALL_SETTLE_MS = 250;
 const AUTO_PLAY_AFTER_MISSED_TURNS = 2;
@@ -1173,7 +1173,16 @@ function updateOneWindowAfterPlay(state: GameStateInternal, player: PlayerState)
   }
 
   if (player.hand.length === 1) {
-    const opensAt = Date.now() + ONE_CALL_DELAY_MS;
+    // Compute a per-round delay so the highest-ping player still receives the
+    // snapshot before the window opens. Using RTT/2 (one-way latency) + buffer
+    // ensures every client has the data in hand when opensAt fires.
+    const activePings = state.players
+      .filter((p) => p.connected && !p.away && p.id !== player.id)
+      .map((p) => p.ping);
+    const maxPing = Math.max(...activePings, 0);
+    const networkDelay = Math.max(Math.ceil(maxPing / 2) + ONE_DELAY_EXTRA_MS, MIN_ONE_DELAY_MS);
+
+    const opensAt = Date.now() + networkDelay;
     finalizePendingOneCall(state);
     player.calledOne = false;
     state.oneWindow = {
