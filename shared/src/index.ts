@@ -106,6 +106,7 @@ export interface PublicPlayer {
   autoPlay: boolean;
   missedDisconnectedTurns: number;
   finishedRank?: number;
+  ping: number;
 }
 
 export interface PrivatePlayerState {

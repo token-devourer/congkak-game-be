@@ -160,6 +160,7 @@ export function addPlayer(
     calledOne: false,
     autoPlay: false,
     missedDisconnectedTurns: 0,
+    ping: 0,
     hand: [],
     resumeToken: createResumeToken(state)
   });
@@ -1468,6 +1469,7 @@ function toPublicPlayer(player: PlayerState): PublicPlayer {
     calledOne: player.calledOne,
     autoPlay: player.autoPlay,
     missedDisconnectedTurns: player.missedDisconnectedTurns,
+    ping: player.ping,
     ...(player.finishedRank ? { finishedRank: player.finishedRank } : {})
   };
 }
@@ -1510,6 +1512,7 @@ function promoteWaitingPlayers(state: GameStateInternal): void {
       calledOne: false,
       autoPlay: false,
       missedDisconnectedTurns: 0,
+      ping: 0,
       hand: [],
       resumeToken: createResumeToken(state)
     });

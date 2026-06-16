@@ -149,6 +149,14 @@ export class GameRoom extends Room {
       sendEmote(this.game, client.sessionId, payload.emoteId);
       this.broadcastState();
     }));
+
+    this.onMessage("room.ping", (client, message) => {
+      const ping = typeof message?.ping === "number" ? Math.round(Math.max(0, message.ping)) : 0;
+      const player = this.game.players.find((p) => p.id === client.sessionId);
+      if (player) {
+        player.ping = ping;
+      }
+    });
   }
 
   onJoin(client: Client, options: unknown): void {
