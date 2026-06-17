@@ -870,7 +870,7 @@ describe("standard mode", () => {
     expect(snapshotFor(state).currentPlayerId).toBe("p3");
   });
 
-  it("prevents drawing out of a stack when the target can stack", () => {
+  it("lets the stack target take the accumulated penalty even when they can stack", () => {
     const state = controlledGame3();
     state.settings.stackingEnabled = true;
     state.players[0]!.hand = [card("p1-red-draw2", "red", "draw2"), card("p1-blue-1", "blue", 1), card("p1-green-2", "green", 2)];
@@ -880,8 +880,10 @@ describe("standard mode", () => {
     playCard(state, "p1", "p1-red-draw2");
 
     expect(state.pendingStack).toMatchObject({ targetPlayerId: "p2", totalDraw: 2 });
-    expect(() => drawCard(state, "p2")).toThrow("matching draw card");
-    expect(state.players[1]!.hand).toHaveLength(2);
+    drawCard(state, "p2");
+    expect(state.pendingStack).toBeUndefined();
+    expect(state.players[1]!.hand).toHaveLength(4);
+    expect(snapshotFor(state).currentPlayerId).toBe("p3");
   });
 
   it("pauses auto turns when fewer than two active players are available and resumes when one returns", () => {

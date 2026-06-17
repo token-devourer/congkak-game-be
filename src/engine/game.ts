@@ -539,11 +539,6 @@ export function drawCard(state: GameStateInternal, playerId: string, automated =
   ensureNoActiveOneWindow(state);
 
   if (state.pendingStack) {
-    const stack = state.pendingStack;
-    if (canPlayerStack(player, stack)) {
-      throw new GameError("stack_required", "You must stack a matching draw card.");
-    }
-
     resolveStackDraw(state, player);
     return;
   }
