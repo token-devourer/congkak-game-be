@@ -15,6 +15,12 @@ function card(id: string, color: Card["color"], value: Card["value"]): Card {
   return { id, color, value, deckIndex: 0 };
 }
 
+// Pre-seed the auto-play delay so it's already elapsed in unit tests.
+function resolveNow(state: GameStateInternal): boolean {
+  state.autoPlayPendingAt = Date.now() - 1001;
+  return resolveAutomatedTurns(state);
+}
+
 function controlledGame3(): GameStateInternal {
   const state = createGame("ABC123", { turnTimeoutSec: 30 });
   addPlayer(state, "p1", "Ava", "sun");
@@ -38,7 +44,7 @@ describe("smart away autoplay", () => {
     state.players[0]!.hand = [card("p1-red-9", "red", 9), card("p1-blue-2", "blue", 2)];
     setPlayerAway(state, "p1", true);
 
-    expect(resolveAutomatedTurns(state)).toBe(true);
+    expect(resolveNow(state)).toBe(true);
 
     expect(state.discardPile.at(-1)?.id).toBe("p1-red-9");
     expect(state.players[0]!.hand.map((c) => c.id)).toEqual(["p1-blue-2"]);
@@ -50,7 +56,7 @@ describe("smart away autoplay", () => {
     state.players[0]!.hand = [card("p1-wild", null, "wild"), card("p1-red-9", "red", 9)];
     setPlayerAway(state, "p1", true);
 
-    resolveAutomatedTurns(state);
+    resolveNow(state);
 
     expect(state.discardPile.at(-1)?.id).toBe("p1-red-9");
     expect(state.players[0]!.hand.map((c) => c.id)).toEqual(["p1-wild"]);
@@ -63,7 +69,7 @@ describe("smart away autoplay", () => {
     state.drawPile = [card("filler", "blue", 2), card("drawn-red-7", "red", 7)];
     setPlayerAway(state, "p1", true);
 
-    resolveAutomatedTurns(state);
+    resolveNow(state);
 
     expect(state.discardPile.at(-1)?.id).toBe("drawn-red-7");
     expect(state.players[0]!.hand.map((c) => c.id).sort()).toEqual(["p1-green-8", "p1-yellow-3"]);
@@ -76,7 +82,7 @@ describe("smart away autoplay", () => {
     state.drawPile = [card("filler", "blue", 1), card("drawn-blue-9", "blue", 9)];
     setPlayerAway(state, "p1", true);
 
-    resolveAutomatedTurns(state);
+    resolveNow(state);
 
     expect(state.discardPile.at(-1)?.id).toBe("discard-red-5");
     expect(state.players[0]!.hand).toHaveLength(3);
@@ -96,7 +102,7 @@ describe("smart away autoplay", () => {
     playCard(state, "p1", "p1-red-draw2");
     expect(state.pendingStack).toMatchObject({ targetPlayerId: "p2", totalDraw: 2 });
 
-    resolveAutomatedTurns(state);
+    resolveNow(state);
 
     expect(state.discardPile.at(-1)?.id).toBe("p2-blue-draw2");
     expect(state.pendingStack).toMatchObject({ targetPlayerId: "p3", totalDraw: 4 });
@@ -109,7 +115,7 @@ describe("smart away autoplay", () => {
     setPlayerAway(state, "p1", true);
 
     // First pass plays down to one card and opens the (not-yet-open) window.
-    resolveAutomatedTurns(state);
+    resolveNow(state);
     expect(state.oneWindow?.playerId).toBe("p1");
     expect(state.players[0]!.calledOne).toBe(false);
 

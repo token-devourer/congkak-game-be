@@ -61,6 +61,8 @@ export interface GameStateInternal {
   roundWinnerId?: string;
   gameWinnerId?: string;
   lastStandPlacements?: LastStandPlacement[];
+  /** Timestamp when we first decided an auto-play was needed; cleared after the move fires. */
+  autoPlayPendingAt?: number;
 }
 
 export class GameError extends Error {
@@ -961,6 +963,17 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
         return changed;
       }
 
+      // Apply 1-second "thinking" delay before acting on the auto player's turn.
+      const nowStack = Date.now();
+      if (state.autoPlayPendingAt === undefined) {
+        state.autoPlayPendingAt = nowStack;
+        return true;
+      }
+      if (nowStack - state.autoPlayPendingAt < 1000) {
+        return true;
+      }
+      state.autoPlayPendingAt = undefined;
+
       // Stack a matching draw card when held; otherwise eat the pile.
       const stackCardId = autoStackCardId(player, state.pendingStack);
       if (stackCardId) {
@@ -975,8 +988,20 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
     }
 
     if (!isAutoControllable(player)) {
+      state.autoPlayPendingAt = undefined;
       return changed;
     }
+
+    // Apply 1-second "thinking" delay before acting on the auto player's turn.
+    const nowPlay = Date.now();
+    if (state.autoPlayPendingAt === undefined) {
+      state.autoPlayPendingAt = nowPlay;
+      return true;
+    }
+    if (nowPlay - state.autoPlayPendingAt < 1000) {
+      return true;
+    }
+    state.autoPlayPendingAt = undefined;
 
     autoPlayTurn(state, player);
     changed = true;
@@ -1484,6 +1509,7 @@ function reshuffleDiscard(state: GameStateInternal): void {
 
 function advanceTurn(state: GameStateInternal, skippedPlayers = 0): void {
   state.currentSeat = seatAfter(state, state.currentSeat, skippedPlayers + 1);
+  state.autoPlayPendingAt = undefined;
   setTurnDeadline(state);
 }
 

@@ -440,6 +440,7 @@ describe("standard mode", () => {
     const handSize = state.players[0]!.hand.length;
     state.currentSeat = 0;
     state.turnDeadline = Date.now() + 30_000;
+    state.autoPlayPendingAt = Date.now() - 1001;
     expect(resolveAutomatedTurns(state)).toBe(true);
     expect(state.players[0]!.hand).toHaveLength(handSize + 1);
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
@@ -472,6 +473,7 @@ describe("standard mode", () => {
     setPlayerAway(state, "p1", true);
 
     expect(state.players[0]!).toMatchObject({ connected: true, away: true, autoPlay: true });
+    state.autoPlayPendingAt = Date.now() - 1001;
     expect(resolveAutomatedTurns(state)).toBe(true);
     expect(state.players[0]!.hand).toHaveLength(2);
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
