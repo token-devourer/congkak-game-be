@@ -15,6 +15,7 @@ import {
   resolveChallenge,
   resolvePendingBatchPlay,
   resolvePendingOneCall,
+  resolveRoundDeal,
   setPlayerAway,
   setPlayerConnected,
   setReady,
@@ -62,6 +63,17 @@ function controlledGame3(): GameStateInternal {
   state.players[1]!.hand = [];
   state.players[2]!.hand = [];
   return state;
+}
+
+function finishAutomaticDeal(state: GameStateInternal): void {
+  for (let index = 0; index < 4 && state.phase === "dealing"; index += 1) {
+    const event = state.roundDeal?.event;
+    if (event) {
+      event.startsAt = 0;
+      event.resolvesAt = 0;
+    }
+    resolveRoundDeal(state);
+  }
 }
 
 describe("standard mode", () => {
@@ -658,7 +670,7 @@ describe("standard mode", () => {
     playCard(state, "p2", "p2-red-2");
     startRound(state);
 
-    expect(state.phase).toBe("playing");
+    expect(state.phase).toBe("dealing");
     expect(state.lastStandPlacements).toBeUndefined();
     expect(state.players.every((player) => player.finishedRank === undefined)).toBe(true);
   });
@@ -670,6 +682,7 @@ describe("standard mode", () => {
     setReady(state, "p2", true);
 
     startRound(state);
+    finishAutomaticDeal(state);
 
     expect(state.phase).toBe("playing");
     expect([7, 9]).toContain(state.players[0]!.hand.length);
@@ -694,6 +707,7 @@ describe("standard mode", () => {
 
     setPlayerConnected(state, "p3", false);
     startRound(state);
+    finishAutomaticDeal(state);
 
     expect(state.players.map((player) => player.id)).toEqual(["p1", "p2"]);
     expect(state.players.every((player) => player.hand.length >= 7)).toBe(true);
@@ -727,6 +741,7 @@ describe("standard mode", () => {
     }
 
     startRound(state);
+    finishAutomaticDeal(state);
 
     // Two deck boxes = 216 cards. Assert conservation rather than an exact
     // draw-pile size, since a Draw Two opener legitimately deals two extra cards.

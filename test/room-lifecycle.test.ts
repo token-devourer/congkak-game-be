@@ -5,12 +5,24 @@ import {
   createGame,
   kickPlayer,
   removePlayer,
+  resolveRoundDeal,
   setReady,
   setPlayerConnected,
   snapshotFor,
   startRound,
   updateSettings
 } from "../src/engine/game.js";
+
+function finishAutomaticDeal(state: ReturnType<typeof createGame>): void {
+  for (let index = 0; index < 4 && state.phase === "dealing"; index += 1) {
+    const event = state.roundDeal?.event;
+    if (event) {
+      event.startsAt = 0;
+      event.resolvesAt = 0;
+    }
+    resolveRoundDeal(state);
+  }
+}
 
 describe("room lifecycle", () => {
   it("supports settings, ready check, kick, and host migration", () => {
@@ -149,6 +161,7 @@ describe("room lifecycle", () => {
     expect(snapshotFor(state, "late").self?.role).toBe("waiting");
 
     startRound(state);
+    finishAutomaticDeal(state);
 
     expect(snapshotFor(state, "late").self?.role).toBe("player");
     expect(state.players.find((player) => player.id === "late")?.hand).toHaveLength(7);

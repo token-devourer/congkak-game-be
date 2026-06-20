@@ -45,7 +45,7 @@ export const CARD_VALUES = [
 ] as const;
 
 export type CardValue = (typeof CARD_VALUES)[number];
-export type GamePhase = "lobby" | "playing" | "roundEnd" | "gameEnd";
+export type GamePhase = "lobby" | "dealing" | "playing" | "roundEnd" | "gameEnd";
 export type Direction = 1 | -1;
 export type ScoreTarget = 0 | 500 | "lastStand";
 export type ParticipantRole = "player" | "waiting" | "spectator";
@@ -173,6 +173,43 @@ export interface PendingBatchPlay {
   resolvesAt: number;
 }
 
+export type RoundDealStage = "shuffleChoice" | "manual" | "auto" | "opening";
+
+export type RoundDealEvent =
+  | {
+      id: number;
+      kind: "shuffle";
+      playerId: string;
+      startsAt: number;
+      resolvesAt: number;
+    }
+  | {
+      id: number;
+      kind: "deal";
+      targetPlayerIds: string[];
+      startsAt: number;
+      cardIntervalMs: number;
+      resolvesAt: number;
+    }
+  | {
+      id: number;
+      kind: "opening";
+      card: Card;
+      startsAt: number;
+      resolvesAt: number;
+    };
+
+export interface RoundDealState {
+  dealerPlayerId?: string;
+  firstPlayerId: string;
+  stage: RoundDealStage;
+  cardsPerPlayer: number;
+  readyPlayerCount: number;
+  totalPlayerCount: number;
+  inactivityDeadline?: number;
+  event?: RoundDealEvent;
+}
+
 export interface LastStandPlacement {
   playerId: string;
   rank: number;
@@ -186,6 +223,7 @@ export interface GameLogEntry {
     | "room"
     | "play"
     | "batch"
+    | "deal"
     | "draw"
     | "skip"
     | "reverse"
@@ -233,6 +271,7 @@ export interface GameSnapshot {
   pendingChallenge?: PendingChallenge;
   pendingStack?: PendingStack;
   pendingBatchPlay?: PendingBatchPlay;
+  roundDeal?: RoundDealState;
   pauseReason?: PauseReason;
   oneWindow?: OneWindow;
   roundNumber: number;
@@ -340,6 +379,10 @@ export const playBatchSchema = z.object({
     message: "Card ids must be unique."
   }),
   declaredColor: z.enum(COLORS).optional()
+});
+
+export const dealCardSchema = z.object({
+  targetPlayerId: z.string().min(1)
 });
 
 export const playDrawnSchema = z.object({

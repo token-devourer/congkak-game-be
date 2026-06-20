@@ -16,6 +16,8 @@ import type {
   PublicViewer,
   RoomSettings,
   RoomSettingsInput,
+  RoundDealEvent,
+  RoundDealState,
   RoundScoreBreakdown
 } from "@congcard/shared";
 import { COLORS, mergeRoomSettings } from "@congcard/shared";
@@ -38,6 +40,15 @@ const BATCH_MAX_START_SPAN_MS = 1800;
 const BATCH_MAX_CARD_INTERVAL_MS = 180;
 const BATCH_MIN_CARD_INTERVAL_MS = 40;
 const BATCH_FLIGHT_DURATION_MS = 800;
+const DEAL_INACTIVITY_MS = 30_000;
+const DEAL_SYNC_MIN_LEAD_MS = 300;
+const DEAL_SYNC_EXTRA_MS = 150;
+const DEAL_FLIGHT_DURATION_MS = 800;
+const SHUFFLE_DURATION_MS = 1_800;
+const OPENING_DURATION_MS = 900;
+const AUTO_DEAL_MIN_DURATION_MS = 6_000;
+const AUTO_DEAL_MAX_DURATION_MS = 10_000;
+const AUTO_DEAL_BASE_INTERVAL_MS = 180;
 
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
@@ -50,6 +61,12 @@ export type ViewerState = PublicViewer;
 interface PendingBatchPlayInternal extends PendingBatchPlay {
   handBefore: Card[];
   activeColorBefore: Color;
+}
+
+interface DealQueueInternal {
+  cards: Card[];
+  targetPlayerIds: string[];
+  nextIndex: number;
 }
 
 export interface GameStateInternal {
@@ -67,6 +84,8 @@ export interface GameStateInternal {
   pendingChallenge?: PendingChallenge;
   pendingStack?: PendingStack;
   pendingBatchPlay?: PendingBatchPlayInternal;
+  roundDeal?: RoundDealState;
+  dealQueue?: DealQueueInternal;
   pauseReason?: PauseReason;
   oneWindow?: { playerId: string; opensAt: number; deadline: number };
   pendingOneCall?: { playerId: string; resolvesAt: number };
@@ -80,6 +99,7 @@ export interface GameStateInternal {
   roundScore?: RoundScoreBreakdown;
   /** Timestamp when we first decided an auto-play was needed; cleared after the move fires. */
   autoPlayPendingAt?: number;
+  dealEventSeq: number;
 }
 
 export class GameError extends Error {
@@ -104,7 +124,8 @@ export function createGame(code: string, settings?: RoomSettingsInput): GameStat
     currentSeat: 0,
     roundNumber: 0,
     seq: 0,
-    actionLog: []
+    actionLog: [],
+    dealEventSeq: 0
   };
 }
 
@@ -206,6 +227,7 @@ export function setPlayerConnected(state: GameStateInternal, id: string, connect
     pushLog(state, "room", `${player.nickname} disconnected.`);
     assignHost(state);
     syncPauseState(state);
+    syncRoundDealer(state);
   } else {
     connectPlayer(state, player);
   }
@@ -228,6 +250,7 @@ export function setPlayerAway(state: GameStateInternal, id: string, away: boolea
   pushLog(state, "room", away ? `${player.nickname} is away.` : `${player.nickname} returned to the table.`);
   assignHost(state);
   syncPauseState(state);
+  syncRoundDealer(state);
 }
 
 export function removePlayer(state: GameStateInternal, id: string): void {
@@ -251,11 +274,15 @@ export function removePlayer(state: GameStateInternal, id: string): void {
 
   pushLog(state, "room", `${player.nickname} left the room.`);
   assignHost(state);
+  syncRoundDealer(state);
 }
 
 export function setReady(state: GameStateInternal, id: string, ready: boolean): void {
   const player = findPlayer(state, id);
   ensurePlayerInteractive(player);
+  if (state.phase !== "lobby") {
+    throw new GameError("ready_locked", "Ready status can only change in the lobby.");
+  }
   player.ready = ready;
   pushLog(state, "room", `${player.nickname} is ${ready ? "ready" : "not ready"}.`);
 }
@@ -300,6 +327,10 @@ export function kickPlayer(state: GameStateInternal, hostId: string, targetId: s
 
   if (hostId === targetId) {
     throw new GameError("invalid_kick", "The host cannot kick themselves.");
+  }
+
+  if (state.phase === "dealing") {
+    throw new GameError("round_setup_active", "Players cannot be kicked while cards are being dealt.");
   }
 
   const target = findPlayer(state, targetId);
@@ -363,7 +394,7 @@ export function kickPlayer(state: GameStateInternal, hostId: string, targetId: s
 }
 
 export function startRound(state: GameStateInternal): void {
-  if (state.phase === "playing") {
+  if (state.phase === "dealing" || state.phase === "playing") {
     throw new GameError("game_in_progress", "This round is already in progress.");
   }
 
@@ -372,6 +403,7 @@ export function startRound(state: GameStateInternal): void {
   }
 
   const mode = getMode(state.settings);
+  const previousPlacements = state.lastStandPlacements ? [...state.lastStandPlacements] : undefined;
 
   if (state.phase === "roundEnd") {
     promoteWaitingPlayers(state);
@@ -396,7 +428,7 @@ export function startRound(state: GameStateInternal): void {
     throw new GameError("not_enough_players", "At least two player seats are required.");
   }
 
-  state.phase = "playing";
+  state.phase = "dealing";
   state.direction = 1;
   state.settings.deckBoxes = Math.max(state.settings.deckBoxes, requiredDeckBoxes(activePlayers.length));
   state.drawPile = mode.buildDeck(activePlayers.length, state.settings.deckBoxes);
@@ -404,6 +436,8 @@ export function startRound(state: GameStateInternal): void {
   delete state.pendingChallenge;
   delete state.pendingStack;
   delete state.pendingBatchPlay;
+  delete state.roundDeal;
+  delete state.dealQueue;
   delete state.pauseReason;
   delete state.oneWindow;
   delete state.pendingOneCall;
@@ -422,26 +456,178 @@ export function startRound(state: GameStateInternal): void {
     delete player.finishedRank;
   }
 
-  for (let count = 0; count < mode.initialHandSize; count += 1) {
-    for (const player of activePlayers) {
-      player.hand.push(drawOne(state));
-      player.cardCount = player.hand.length;
+  const host = activePlayers.find((player) => player.isHost) ?? activePlayers[0]!;
+  const previousWinnerId = previousPlacements?.find((placement) => placement.rank === 1)?.playerId;
+  const previousLoserId = previousPlacements?.find((placement) => placement.isLoser)?.playerId;
+  const firstPlayer = previousPlacements
+    ? activePlayers.find((player) => player.id === previousWinnerId) ?? activePlayers[0]!
+    : host;
+  const preferredDealer = activePlayers.find((player) => player.id === previousLoserId) ?? host;
+  const dealer = isAvailablePlayer(preferredDealer)
+    ? preferredDealer
+    : activePlayers.find((player) => player.isHost && isAvailablePlayer(player)) ?? activePlayers.find(isAvailablePlayer);
+
+  state.currentSeat = firstPlayer.seat;
+  state.roundDeal = {
+    ...(isLastStand(state) && dealer ? { dealerPlayerId: dealer.id } : {}),
+    firstPlayerId: firstPlayer.id,
+    stage: isLastStand(state) ? "shuffleChoice" : "auto",
+    cardsPerPlayer: mode.initialHandSize,
+    readyPlayerCount: 0,
+    totalPlayerCount: activePlayers.length,
+    ...(isLastStand(state) ? { inactivityDeadline: Date.now() + DEAL_INACTIVITY_MS } : {})
+  };
+
+  pushLog(state, "deal", `Round ${state.roundNumber} dealing started.`);
+  if (!isLastStand(state)) {
+    scheduleAutoDeal(state);
+  }
+}
+
+export function reshuffleRoundDeck(state: GameStateInternal, playerId: string): void {
+  const deal = ensureRoundDealer(state, playerId);
+  if (deal.stage !== "shuffleChoice" || deal.event || state.players.some((player) => player.hand.length > 0)) {
+    throw new GameError("shuffle_unavailable", "The deck can only be reshuffled before dealing starts.");
+  }
+
+  const startsAt = Date.now() + dealSyncLead(state);
+  deal.event = {
+    id: nextDealEventId(state),
+    kind: "shuffle",
+    playerId,
+    startsAt,
+    resolvesAt: startsAt + SHUFFLE_DURATION_MS
+  };
+  delete deal.inactivityDeadline;
+}
+
+export function beginManualDeal(state: GameStateInternal, playerId: string): void {
+  const deal = ensureRoundDealer(state, playerId);
+  if (deal.stage !== "shuffleChoice" || deal.event) {
+    throw new GameError("deal_unavailable", "Manual dealing cannot begin right now.");
+  }
+
+  deal.stage = "manual";
+  deal.inactivityDeadline = Date.now() + DEAL_INACTIVITY_MS;
+  pushLog(state, "deal", `${findPlayer(state, playerId).nickname} began dealing.`);
+}
+
+export function dealRoundCard(state: GameStateInternal, playerId: string, targetPlayerId: string): void {
+  const deal = ensureRoundDealer(state, playerId);
+  if (deal.stage !== "manual" || deal.event || state.dealQueue) {
+    throw new GameError("deal_unavailable", "Wait for the current card to land.");
+  }
+
+  const target = findPlayer(state, targetPlayerId);
+  if (target.hand.length >= deal.cardsPerPlayer) {
+    throw new GameError("hand_ready", "That player already has enough cards.");
+  }
+
+  scheduleDealSequence(state, [target.id], false);
+}
+
+export function autoDealRound(state: GameStateInternal, playerId?: string): void {
+  const deal = ensureDealing(state);
+  if (playerId !== undefined) {
+    ensureRoundDealer(state, playerId);
+  }
+  if (deal.event || state.dealQueue) {
+    throw new GameError("deal_unavailable", "Wait for the current setup animation to finish.");
+  }
+  if (playerId !== undefined && deal.stage !== "manual") {
+    throw new GameError("deal_unavailable", "Choose Deal Cards before using Auto Deal.");
+  }
+
+  scheduleAutoDeal(state);
+}
+
+export function resolveRoundDeal(state: GameStateInternal): boolean {
+  if (state.phase !== "dealing" || !state.roundDeal) {
+    return false;
+  }
+
+  let changed = syncRoundDealer(state);
+  const deal = state.roundDeal;
+  const now = Date.now();
+
+  if (!deal.event && deal.inactivityDeadline && now >= deal.inactivityDeadline) {
+    scheduleAutoDeal(state);
+    return true;
+  }
+
+  const event = deal.event;
+  if (!event) {
+    return changed;
+  }
+
+  if (event.kind === "shuffle") {
+    if (now < event.resolvesAt) {
+      return changed;
     }
-  }
-
-  let opener = drawOne(state);
-  while (opener.value === "wild4") {
-    state.drawPile.unshift(opener);
     state.drawPile = shuffleCards(state.drawPile);
-    opener = drawOne(state);
+    delete deal.event;
+    deal.inactivityDeadline = now + DEAL_INACTIVITY_MS;
+    pushLog(state, "deal", `${findPlayer(state, event.playerId).nickname} reshuffled the deck.`);
+    return true;
   }
 
-  state.discardPile.push(opener);
-  state.activeColor = opener.color ?? randomColor();
-  state.currentSeat = activePlayers[0]!.seat;
-  applyOpeningCard(state, opener);
+  if (event.kind === "deal") {
+    const queue = state.dealQueue;
+    if (!queue) {
+      delete deal.event;
+      return true;
+    }
+
+    while (queue.nextIndex < queue.cards.length) {
+      const landingAt = event.startsAt + queue.nextIndex * event.cardIntervalMs + DEAL_FLIGHT_DURATION_MS;
+      if (now < landingAt) {
+        break;
+      }
+
+      const target = findPlayer(state, queue.targetPlayerIds[queue.nextIndex]!);
+      target.hand.push(queue.cards[queue.nextIndex]!);
+      target.cardCount = target.hand.length;
+      target.ready = target.hand.length >= deal.cardsPerPlayer;
+      queue.nextIndex += 1;
+      changed = true;
+    }
+
+    if (changed) {
+      syncDealProgress(state);
+    }
+
+    if (queue.nextIndex < queue.cards.length || now < event.resolvesAt) {
+      return changed;
+    }
+
+    delete state.dealQueue;
+    delete deal.event;
+    syncDealProgress(state);
+    if (deal.readyPlayerCount === deal.totalPlayerCount) {
+      scheduleOpeningCard(state);
+    } else if (deal.stage === "auto") {
+      scheduleAutoDeal(state);
+    } else {
+      deal.inactivityDeadline = now + DEAL_INACTIVITY_MS;
+    }
+    return true;
+  }
+
+  if (now < event.resolvesAt) {
+    return changed;
+  }
+
+  state.discardPile.push(event.card);
+  state.activeColor = event.card.color ?? randomColor();
+  const starter = state.players.find((player) => player.id === deal.firstPlayerId) ?? sortedPlayers(state)[0]!;
+  state.currentSeat = starter.seat;
+  delete state.roundDeal;
+  delete state.dealQueue;
+  state.phase = "playing";
+  applyOpeningCard(state, event.card);
   setTurnDeadline(state);
   pushLog(state, "round", `Round ${state.roundNumber} started.`);
+  return true;
 }
 
 export function playCard(
@@ -1004,7 +1190,7 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
     viewers: sortedViewers(state),
     direction: state.direction,
     roundNumber: state.roundNumber,
-    drawPileCount: state.drawPile.length,
+    drawPileCount: state.drawPile.length + Math.max(0, (state.dealQueue?.cards.length ?? 0) - (state.dealQueue?.nextIndex ?? 0)),
     actionLog: state.actionLog.slice(-30)
   };
 
@@ -1012,7 +1198,7 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
     snapshot.self = {
       id: self.id,
       role: "player",
-      hand: self.hand,
+      hand: state.phase === "dealing" ? [] : self.hand,
       resumeToken: self.resumeToken,
       ...(self.drawnCardId ? { drawnCardId: self.drawnCardId } : {})
     };
@@ -1060,6 +1246,10 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
       cardIntervalMs: pending.cardIntervalMs,
       resolvesAt: pending.resolvesAt
     };
+  }
+
+  if (state.roundDeal) {
+    snapshot.roundDeal = state.roundDeal;
   }
 
   if (state.pauseReason) {
@@ -1867,6 +2057,155 @@ function drawOne(state: GameStateInternal): Card {
   return card;
 }
 
+function ensureDealing(state: GameStateInternal): RoundDealState {
+  if (state.phase !== "dealing" || !state.roundDeal) {
+    throw new GameError("not_dealing", "The round is not currently being dealt.");
+  }
+  return state.roundDeal;
+}
+
+function ensureRoundDealer(state: GameStateInternal, playerId: string): RoundDealState {
+  const deal = ensureDealing(state);
+  syncRoundDealer(state);
+  if (!deal.dealerPlayerId || deal.dealerPlayerId !== playerId) {
+    throw new GameError("not_dealer", "Only the assigned dealer can do that.");
+  }
+  const dealer = findPlayer(state, playerId);
+  ensurePlayerInteractive(dealer);
+  return deal;
+}
+
+function syncRoundDealer(state: GameStateInternal): boolean {
+  const deal = state.roundDeal;
+  if (state.phase !== "dealing" || !deal || !isLastStand(state)) {
+    return false;
+  }
+
+  const current = deal.dealerPlayerId ? state.players.find((player) => player.id === deal.dealerPlayerId) : undefined;
+  if (current && isAvailablePlayer(current)) {
+    return false;
+  }
+
+  const replacement =
+    state.players.find((player) => player.isHost && isAvailablePlayer(player)) ??
+    sortedPlayers(state).find(isAvailablePlayer);
+  const nextId = replacement?.id;
+  if (nextId === deal.dealerPlayerId) {
+    return false;
+  }
+
+  if (nextId) {
+    deal.dealerPlayerId = nextId;
+  } else {
+    delete deal.dealerPlayerId;
+  }
+  if (!deal.event) {
+    if (nextId) {
+      deal.inactivityDeadline = Date.now() + DEAL_INACTIVITY_MS;
+    } else {
+      delete deal.inactivityDeadline;
+    }
+  }
+  if (replacement) {
+    pushLog(state, "deal", `${replacement.nickname} is now the dealer.`);
+  }
+  return true;
+}
+
+function scheduleAutoDeal(state: GameStateInternal): void {
+  const deal = ensureDealing(state);
+  if (deal.event || state.dealQueue) {
+    return;
+  }
+
+  const players = sortedPlayers(state);
+  const starterIndex = Math.max(0, players.findIndex((player) => player.id === deal.firstPlayerId));
+  const ordered = players.map((_, index) => players[(starterIndex + index) % players.length]!);
+  const counts = new Map(players.map((player) => [player.id, player.hand.length]));
+  const targets: string[] = [];
+
+  while ([...counts.values()].some((count) => count < deal.cardsPerPlayer)) {
+    for (const player of ordered) {
+      const count = counts.get(player.id) ?? 0;
+      if (count >= deal.cardsPerPlayer) {
+        continue;
+      }
+      targets.push(player.id);
+      counts.set(player.id, count + 1);
+    }
+  }
+
+  if (targets.length === 0) {
+    scheduleOpeningCard(state);
+    return;
+  }
+
+  deal.stage = "auto";
+  scheduleDealSequence(state, targets, true);
+}
+
+function scheduleDealSequence(state: GameStateInternal, targetPlayerIds: string[], adaptive: boolean): void {
+  const deal = ensureDealing(state);
+  const cards = targetPlayerIds.map(() => drawOne(state));
+  const startsAt = Date.now() + dealSyncLead(state);
+  const targetDuration = Math.min(
+    AUTO_DEAL_MAX_DURATION_MS,
+    Math.max(AUTO_DEAL_MIN_DURATION_MS, targetPlayerIds.length * AUTO_DEAL_BASE_INTERVAL_MS)
+  );
+  const cardIntervalMs = adaptive && targetPlayerIds.length > 1
+    ? Math.max(80, Math.round(targetDuration / targetPlayerIds.length))
+    : 0;
+  const resolvesAt = startsAt + (targetPlayerIds.length - 1) * cardIntervalMs + DEAL_FLIGHT_DURATION_MS;
+  const event: RoundDealEvent = {
+    id: nextDealEventId(state),
+    kind: "deal",
+    targetPlayerIds,
+    startsAt,
+    cardIntervalMs,
+    resolvesAt
+  };
+
+  state.dealQueue = { cards, targetPlayerIds, nextIndex: 0 };
+  deal.event = event;
+  delete deal.inactivityDeadline;
+}
+
+function scheduleOpeningCard(state: GameStateInternal): void {
+  const deal = ensureDealing(state);
+  let opener = drawOne(state);
+  while (opener.value === "wild4") {
+    state.drawPile.unshift(opener);
+    state.drawPile = shuffleCards(state.drawPile);
+    opener = drawOne(state);
+  }
+
+  deal.stage = "opening";
+  delete deal.inactivityDeadline;
+  const startsAt = Date.now() + dealSyncLead(state);
+  deal.event = {
+    id: nextDealEventId(state),
+    kind: "opening",
+    card: opener,
+    startsAt,
+    resolvesAt: startsAt + OPENING_DURATION_MS
+  };
+}
+
+function syncDealProgress(state: GameStateInternal): void {
+  const deal = ensureDealing(state);
+  deal.readyPlayerCount = state.players.filter((player) => player.hand.length >= deal.cardsPerPlayer).length;
+}
+
+function dealSyncLead(state: GameStateInternal): number {
+  const maxPing = Math.max(...state.players.filter(isAvailablePlayer).map((player) => player.ping), 0);
+  return Math.max(DEAL_SYNC_MIN_LEAD_MS, Math.ceil(maxPing / 2) + DEAL_SYNC_EXTRA_MS);
+}
+
+function nextDealEventId(state: GameStateInternal): number {
+  state.dealEventSeq += 1;
+  return state.dealEventSeq;
+}
+
 function reshuffleDiscard(state: GameStateInternal): void {
   if (state.discardPile.length <= 1) {
     return;
@@ -1950,6 +2289,7 @@ function connectPlayer(state: GameStateInternal, player: PlayerState): void {
   player.autoPlay = false;
   assignHost(state);
   syncPauseState(state);
+  syncRoundDealer(state);
   if (!wasConnected) {
     pushLog(state, "room", `${player.nickname} reconnected.`);
   }
@@ -2031,6 +2371,26 @@ function rebindPlayerSession(state: GameStateInternal, oldId: string, newId: str
 
   if (state.pendingBatchPlay?.playerId === oldId) {
     state.pendingBatchPlay.playerId = newId;
+  }
+
+  if (state.roundDeal?.dealerPlayerId === oldId) {
+    state.roundDeal.dealerPlayerId = newId;
+  }
+
+  if (state.roundDeal?.firstPlayerId === oldId) {
+    state.roundDeal.firstPlayerId = newId;
+  }
+
+  if (state.roundDeal?.event?.kind === "shuffle" && state.roundDeal.event.playerId === oldId) {
+    state.roundDeal.event.playerId = newId;
+  }
+
+  if (state.roundDeal?.event?.kind === "deal") {
+    state.roundDeal.event.targetPlayerIds = state.roundDeal.event.targetPlayerIds.map((id) => id === oldId ? newId : id);
+  }
+
+  if (state.dealQueue) {
+    state.dealQueue.targetPlayerIds = state.dealQueue.targetPlayerIds.map((id) => id === oldId ? newId : id);
   }
 
   if (state.roundWinnerId === oldId) {

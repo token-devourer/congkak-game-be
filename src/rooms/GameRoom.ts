@@ -2,6 +2,7 @@ import { Client, Room } from "@colyseus/core";
 import {
   challengeSchema,
   catchOneSchema,
+  dealCardSchema,
   emoteSchema,
   joinOptionsSchema,
   kickSchema,
@@ -14,10 +15,13 @@ import {
 import { config } from "../config.js";
 import {
   addPlayer,
+  autoDealRound,
+  beginManualDeal,
   callOne,
   catchOne,
   createGame,
   drawCard,
+  dealRoundCard,
   expireOneWindow,
   GameError,
   handleTurnTimeout,
@@ -29,8 +33,10 @@ import {
   resolveChallenge,
   resolveAutomatedTurns,
   resolvePendingBatchPlay,
+  resolveRoundDeal,
   resolvePendingOneCall,
   sendEmote,
+  reshuffleRoundDeck,
   setPlayerConnected,
   setPlayerAway,
   setReady,
@@ -69,6 +75,7 @@ export class GameRoom extends Room {
     this.setPrivate(true);
     this.clock.setInterval(() => {
       try {
+        const dealChanged = resolveRoundDeal(this.game);
         const batchResolved = resolvePendingBatchPlay(this.game);
         const oneCallResolved = resolvePendingOneCall(this.game);
         const windowClosed = expireOneWindow(this.game);
@@ -76,6 +83,7 @@ export class GameRoom extends Room {
         const timedOut = handleTurnTimeout(this.game);
         const autoPlayedAfterTimeout = resolveAutomatedTurns(this.game);
         if (
+          dealChanged ||
           batchResolved ||
           oneCallResolved ||
           windowClosed ||
@@ -122,6 +130,27 @@ export class GameRoom extends Room {
       }
 
       startRound(this.game);
+      this.broadcastState();
+    }));
+
+    this.onMessage("game.reshuffleDeck", (client) => this.safe(client, () => {
+      reshuffleRoundDeck(this.game, client.sessionId);
+      this.broadcastState();
+    }));
+
+    this.onMessage("game.beginDeal", (client) => this.safe(client, () => {
+      beginManualDeal(this.game, client.sessionId);
+      this.broadcastState();
+    }));
+
+    this.onMessage("game.dealCard", (client, message) => this.safe(client, () => {
+      const payload = dealCardSchema.parse(message);
+      dealRoundCard(this.game, client.sessionId, payload.targetPlayerId);
+      this.broadcastState();
+    }));
+
+    this.onMessage("game.autoDeal", (client) => this.safe(client, () => {
+      autoDealRound(this.game, client.sessionId);
       this.broadcastState();
     }));
 
