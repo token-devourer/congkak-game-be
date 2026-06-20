@@ -43,11 +43,21 @@ describe("room lifecycle", () => {
     expect(state.settings.stackingEnabled).toBe(true);
     expect(state.settings.challengeEnabled).toBe(true);
     expect(state.settings.batchEnabled).toBe(false);
+    expect(state.settings.keyboardShortcutsEnabled).toBe(true);
     expect(state.settings.absentPlayerAction).toBe("draw");
     expect(state.settings.autoPlayCallOne).toBe(false);
 
     updateSettings(state, "host", { batchEnabled: true });
     expect(state.settings.batchEnabled).toBe(true);
+
+    updateSettings(state, "host", { keyboardShortcutsEnabled: false });
+    expect(state.settings.keyboardShortcutsEnabled).toBe(false);
+    expect(state.settings.batchEnabled).toBe(true);
+    expect(state.settings.jumpInEnabled).toBe(true);
+    expect(state.settings.stackingEnabled).toBe(true);
+
+    updateSettings(state, "host", { keyboardShortcutsEnabled: true });
+    expect(state.settings.keyboardShortcutsEnabled).toBe(true);
 
     updateSettings(state, "host", { absentPlayerAction: "autoplay", autoPlayCallOne: true });
     expect(state.settings.absentPlayerAction).toBe("autoplay");

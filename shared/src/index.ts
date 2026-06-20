@@ -77,6 +77,7 @@ export interface RoomSettings {
   challengeEnabled: boolean;
   callEnabled: boolean;
   batchEnabled: boolean;
+  keyboardShortcutsEnabled: boolean;
   absentPlayerAction: AbsentPlayerAction;
   autoPlayCallOne: boolean;
   deckBoxes: number;
@@ -94,6 +95,7 @@ export type RoomSettingsInput = {
   challengeEnabled?: RoomSettings["challengeEnabled"] | undefined;
   callEnabled?: RoomSettings["callEnabled"] | undefined;
   batchEnabled?: RoomSettings["batchEnabled"] | undefined;
+  keyboardShortcutsEnabled?: RoomSettings["keyboardShortcutsEnabled"] | undefined;
   absentPlayerAction?: RoomSettings["absentPlayerAction"] | undefined;
   autoPlayCallOne?: RoomSettings["autoPlayCallOne"] | undefined;
   deckBoxes?: RoomSettings["deckBoxes"] | undefined;
@@ -276,6 +278,7 @@ export const DEFAULT_ROOM_SETTINGS: RoomSettings = {
   challengeEnabled: true,
   callEnabled: true,
   batchEnabled: false,
+  keyboardShortcutsEnabled: true,
   absentPlayerAction: "draw",
   autoPlayCallOne: false,
   deckBoxes: 1,
@@ -293,6 +296,7 @@ export const roomSettingsSchema = z.object({
   challengeEnabled: z.boolean().default(true),
   callEnabled: z.boolean().default(true),
   batchEnabled: z.boolean().default(false),
+  keyboardShortcutsEnabled: z.boolean().default(true),
   absentPlayerAction: z.enum(["none", "draw", "autoplay"]).default("draw"),
   autoPlayCallOne: z.boolean().default(false),
   deckBoxes: z.number().int().min(1).max(6).default(1),
@@ -310,6 +314,7 @@ export const roomSettingsUpdateSchema = z.object({
   challengeEnabled: z.boolean().optional(),
   callEnabled: z.boolean().optional(),
   batchEnabled: z.boolean().optional(),
+  keyboardShortcutsEnabled: z.boolean().optional(),
   absentPlayerAction: z.enum(["none", "draw", "autoplay"]).optional(),
   autoPlayCallOne: z.boolean().optional(),
   deckBoxes: z.number().int().min(1).max(6).optional(),
@@ -381,6 +386,7 @@ export function mergeRoomSettings(input?: RoomSettingsInput): RoomSettings {
     challengeEnabled: parsed.challengeEnabled ?? DEFAULT_ROOM_SETTINGS.challengeEnabled,
     callEnabled: parsed.callEnabled ?? (scoreTarget === "lastStand" ? false : DEFAULT_ROOM_SETTINGS.callEnabled),
     batchEnabled: parsed.batchEnabled ?? DEFAULT_ROOM_SETTINGS.batchEnabled,
+    keyboardShortcutsEnabled: parsed.keyboardShortcutsEnabled ?? DEFAULT_ROOM_SETTINGS.keyboardShortcutsEnabled,
     absentPlayerAction: parsed.absentPlayerAction ?? DEFAULT_ROOM_SETTINGS.absentPlayerAction,
     autoPlayCallOne: parsed.autoPlayCallOne ?? DEFAULT_ROOM_SETTINGS.autoPlayCallOne,
     deckBoxes: parsed.deckBoxes ?? DEFAULT_ROOM_SETTINGS.deckBoxes,
