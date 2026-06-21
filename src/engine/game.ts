@@ -22,7 +22,8 @@ import type {
   RoomSettingsInput,
   RoundDealEvent,
   RoundDealState,
-  RoundScoreBreakdown
+  RoundScoreBreakdown,
+  VisibleCardFace
 } from "@congcard/shared";
 import { LIGHT_COLORS, mergeRoomSettings, type FlipSide } from "@congcard/shared";
 import { standardMode, shuffleCards, buildSingleDeck } from "./modes/standard.js";
@@ -58,10 +59,11 @@ const FLIP_SYNC_MIN_LEAD_MS = 350;
 const FLIP_SYNC_EXTRA_MS = 180;
 const FLIP_STEP_MS = 650;
 const FLIP_SETTLE_MS = 520;
-const DRAW_REVEAL_DURATION_MS = 800;
-const DRAW_REVEAL_FACE_AT_MS = 220;
-const DRAW_NEXT_GAP_MS = 120;
+const DRAW_REVEAL_DURATION_MS = 360;
+const DRAW_REVEAL_FACE_AT_MS = 110;
+const DRAW_NEXT_GAP_MS = 70;
 const DRAW_SYNC_EXTRA_MS = 80;
+const DRAW_FINAL_SETTLE_MS = 700;
 
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
@@ -97,7 +99,9 @@ interface PendingDrawInternal {
   targetColor?: Color;
   requiredMatches?: number;
   matchesFound: number;
+  revealedCards: Card[];
   deadline?: number;
+  settlesAt?: number;
   reveal?: {
     id: number;
     index: number;
@@ -2180,6 +2184,7 @@ function queueNormalDraw(state: GameStateInternal, player: PlayerState, automate
     remainingCount: 1,
     totalCount: 1,
     matchesFound: 0,
+    revealedCards: [],
     continuation: { type: "normal", automated }
   });
 }
@@ -2203,6 +2208,7 @@ function queueFixedDraw(
     remainingCount: count,
     totalCount: count,
     matchesFound: 0,
+    revealedCards: [],
     continuation
   });
 }
@@ -2223,6 +2229,7 @@ function queueColorHunt(
     targetColor,
     requiredMatches,
     matchesFound: 0,
+    revealedCards: [],
     deadline: Date.now() + state.settings.turnTimeoutSec * 1000,
     continuation
   });
@@ -2245,14 +2252,15 @@ function startPendingDraw(state: GameStateInternal, pending: PendingDrawInternal
 
 function scheduleNextPendingDraw(state: GameStateInternal): void {
   const pending = state.pendingDraw;
-  if (!pending || pending.reveal) return;
+  if (!pending || pending.reveal || pending.settlesAt) return;
   const card = takeCard(state);
   if (!card) {
     pushLog(state, "round", "The draw pile ran out of cards.");
-    finishPendingDraw(state);
+    if (pending.drawnCount > 0) beginPendingDrawSettle(state);
+    else finishPendingDraw(state);
     return;
   }
-  const startsAt = Date.now() + drawSyncLead(state);
+  const startsAt = Date.now() + (pending.drawnCount === 0 ? drawSyncLead(state) : DRAW_NEXT_GAP_MS);
   state.drawEventSeq += 1;
   pending.reveal = {
     id: state.drawEventSeq,
@@ -2279,7 +2287,7 @@ export function chooseColorDraw(state: GameStateInternal, playerId: string, mode
 export function drawColorCard(state: GameStateInternal, playerId: string): void {
   ensurePlaying(state);
   const pending = state.pendingDraw;
-  if (!pending || pending.reason !== "colorHunt" || pending.playerId !== playerId || pending.mode !== "manual" || pending.reveal) {
+  if (!pending || pending.reason !== "colorHunt" || pending.playerId !== playerId || pending.mode !== "manual" || pending.reveal || pending.settlesAt) {
     throw new GameError("color_draw_unavailable", "Manual Wild Draw Color is not ready.");
   }
   ensurePlayerInteractive(findPlayer(state, playerId));
@@ -2290,6 +2298,12 @@ export function resolvePendingDraw(state: GameStateInternal): boolean {
   const pending = state.pendingDraw;
   if (!pending) return false;
   const now = Date.now();
+
+  if (pending.settlesAt) {
+    if (now < pending.settlesAt) return false;
+    finishPendingDraw(state);
+    return true;
+  }
 
   if (!pending.reveal) {
     const target = findPlayer(state, pending.playerId);
@@ -2314,6 +2328,7 @@ export function resolvePendingDraw(state: GameStateInternal): boolean {
   const player = findPlayer(state, pending.playerId);
   const card = pending.reveal.card;
   player.hand.push(card);
+  pending.revealedCards.push(card);
   pending.drawnCount += 1;
   if (pending.remainingCount !== undefined) pending.remainingCount -= 1;
   if (pending.targetColor && card.color === pending.targetColor) pending.matchesFound += 1;
@@ -2326,11 +2341,18 @@ export function resolvePendingDraw(state: GameStateInternal): boolean {
     pending.reason === "colorHunt" &&
     (pending.matchesFound >= (pending.requiredMatches ?? 1) || pending.drawnCount >= 600);
   if (fixedComplete || colorComplete) {
-    finishPendingDraw(state);
+    beginPendingDrawSettle(state);
   } else if (pending.mode === "auto") {
     scheduleNextPendingDraw(state);
   }
   return true;
+}
+
+function beginPendingDrawSettle(state: GameStateInternal): void {
+  const pending = state.pendingDraw;
+  if (!pending || pending.settlesAt) return;
+  pending.settlesAt = Date.now() + DRAW_FINAL_SETTLE_MS;
+  delete pending.reveal;
 }
 
 function finishPendingDraw(state: GameStateInternal): void {
@@ -2657,6 +2679,17 @@ function publicPendingDraw(state: GameStateInternal, pending: PendingDrawInterna
         ? oppositeCardFace(reveal.card, state.flipSide)
         : undefined
     : undefined;
+  const revealedCards: VisibleCardFace[] = [];
+  for (const card of pending.revealedCards) {
+    if (viewerId === pending.playerId) {
+      revealedCards.push(visibleCardFace(card));
+      continue;
+    }
+    if (state.settings.modeId === "flip" && state.flipSide) {
+      const face = oppositeCardFace(card, state.flipSide);
+      if (face) revealedCards.push({ color: face.color, value: face.value, ...(face.side ? { side: face.side } : {}) });
+    }
+  }
   return {
     playerId: pending.playerId,
     reason: pending.reason,
@@ -2667,6 +2700,8 @@ function publicPendingDraw(state: GameStateInternal, pending: PendingDrawInterna
     ...(pending.requiredMatches !== undefined ? { requiredMatches: pending.requiredMatches } : {}),
     ...(pending.reason === "colorHunt" ? { matchesFound: pending.matchesFound } : {}),
     ...(pending.deadline ? { deadline: pending.deadline } : {}),
+    ...(revealedCards.length > 0 ? { revealedCards } : {}),
+    ...(pending.settlesAt ? { settlesAt: pending.settlesAt } : {}),
     ...(reveal
       ? {
           reveal: {

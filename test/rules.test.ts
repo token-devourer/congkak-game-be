@@ -37,6 +37,7 @@ function settlePendingDraw(state: GameStateInternal): void {
   let guard = 0;
   while (state.pendingDraw && guard < 700) {
     if (state.pendingDraw.reveal) state.pendingDraw.reveal.resolvesAt = 0;
+    if (state.pendingDraw.settlesAt) state.pendingDraw.settlesAt = 1;
     resolvePendingDraw(state);
     guard += 1;
   }
@@ -192,6 +193,8 @@ describe("flip mode", () => {
     drawColorCard(state, "p2");
     state.pendingDraw!.reveal!.resolvesAt = 0;
     resolvePendingDraw(state);
+    state.pendingDraw!.settlesAt = 1;
+    resolvePendingDraw(state);
     expect(state.pendingDraw).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(2);
     expect(snapshotFor(state).currentPlayerId).toBe("p3");
@@ -316,6 +319,30 @@ describe("standard mode", () => {
 
     settlePendingDraw(state);
     expect(state.oneWindow?.playerId).toBe("p1");
+  });
+
+  it("streams multi-card draws quickly and settles once after the final card", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-draw2", "red", "draw2"), card("blue-1", "blue", 1)];
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+
+    playCard(state, "p1", "red-draw2");
+    state.pendingDraw!.reveal!.resolvesAt = 0;
+    resolvePendingDraw(state);
+    expect(state.pendingDraw?.revealedCards).toHaveLength(1);
+    expect(state.pendingDraw!.reveal!.startsAt - Date.now()).toBeLessThanOrEqual(150);
+
+    state.pendingDraw!.reveal!.resolvesAt = 0;
+    const settledAt = Date.now();
+    resolvePendingDraw(state);
+    expect(state.pendingDraw?.revealedCards).toHaveLength(2);
+    expect(state.pendingDraw!.settlesAt! - settledAt).toBeGreaterThanOrEqual(650);
+    expect(snapshotFor(state, "p2").pendingDraw?.revealedCards).toHaveLength(2);
+    expect(snapshotFor(state, "p1").pendingDraw?.revealedCards).toBeUndefined();
+
+    state.pendingDraw!.settlesAt = 1;
+    resolvePendingDraw(state);
+    expect(state.pendingDraw).toBeUndefined();
   });
 
   it("builds a 108 card deck for standard player counts", () => {

@@ -227,6 +227,8 @@ export interface PendingDrawState {
   matchesFound?: number;
   deadline?: number;
   reveal?: PendingDrawReveal;
+  revealedCards?: VisibleCardFace[];
+  settlesAt?: number;
 }
 
 export type RoundDealStage = "shuffleChoice" | "manual" | "auto" | "opening";

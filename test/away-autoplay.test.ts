@@ -24,6 +24,7 @@ function resolveNow(state: GameStateInternal): boolean {
   let guard = 0;
   while (state.pendingDraw && guard < 20) {
     if (state.pendingDraw.reveal) state.pendingDraw.reveal.resolvesAt = 0;
+    if (state.pendingDraw.settlesAt) state.pendingDraw.settlesAt = 1;
     resolvePendingDraw(state);
     guard += 1;
   }
