@@ -74,6 +74,16 @@ export interface Card {
   side?: FlipSide;
 }
 
+export interface VisibleCardFace {
+  color: Color | null;
+  value: CardValue;
+  side?: FlipSide;
+}
+
+export interface OpponentCardFace extends VisibleCardFace {
+  trackingId: string;
+}
+
 export interface RoomSettings {
   modeId: "standard" | "flip";
   maxPlayers: number;
@@ -126,6 +136,7 @@ export interface PublicPlayer {
   missedDisconnectedTurns: number;
   finishedRank?: number;
   ping: number;
+  oppositeHand?: OpponentCardFace[];
 }
 
 export interface PrivatePlayerState {
@@ -191,6 +202,31 @@ export interface PendingFlip {
   transitionTimes: number[];
   resolvesAt: number;
   opening?: boolean;
+}
+
+export type DrawReason = "turn" | "penalty" | "challenge" | "catch" | "timeout" | "autoplay" | "opening" | "colorHunt";
+export type DrawMode = "choice" | "manual" | "auto";
+
+export interface PendingDrawReveal {
+  id: number;
+  index: number;
+  startsAt: number;
+  revealsAt: number;
+  resolvesAt: number;
+  visibleCard?: VisibleCardFace;
+}
+
+export interface PendingDrawState {
+  playerId: string;
+  reason: DrawReason;
+  mode: DrawMode;
+  drawnCount: number;
+  totalCount?: number;
+  targetColor?: Color;
+  requiredMatches?: number;
+  matchesFound?: number;
+  deadline?: number;
+  reveal?: PendingDrawReveal;
 }
 
 export type RoundDealStage = "shuffleChoice" | "manual" | "auto" | "opening";
@@ -291,6 +327,7 @@ export interface GameSnapshot {
   pendingChallenge?: PendingChallenge;
   pendingStack?: PendingStack;
   pendingBatchPlay?: PendingBatchPlay;
+  pendingDraw?: PendingDrawState;
   flipSide?: FlipSide;
   pendingFlip?: PendingFlip;
   roundDeal?: RoundDealState;
@@ -298,6 +335,7 @@ export interface GameSnapshot {
   oneWindow?: OneWindow;
   roundNumber: number;
   drawPileCount: number;
+  drawPileBack?: OpponentCardFace;
   actionLog: GameLogEntry[];
   roundWinnerId?: string;
   gameWinnerId?: string;
@@ -410,6 +448,10 @@ export const dealCardSchema = z.object({
 export const playDrawnSchema = z.object({
   play: z.boolean(),
   declaredColor: z.enum(COLORS).optional()
+});
+
+export const chooseColorDrawSchema = z.object({
+  mode: z.enum(["manual", "auto"])
 });
 
 export const catchOneSchema = z.object({

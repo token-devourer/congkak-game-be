@@ -6,6 +6,7 @@ import {
   createGame,
   playCard,
   resolveAutomatedTurns,
+  resolvePendingDraw,
   setPlayerAway,
   setPlayerConnected,
   snapshotFor,
@@ -19,7 +20,14 @@ function card(id: string, color: Card["color"], value: Card["value"]): Card {
 // Pre-seed the auto-play delay so it's already elapsed in unit tests.
 function resolveNow(state: GameStateInternal): boolean {
   state.autoPlayPendingAt = Date.now() - 2000;
-  return resolveAutomatedTurns(state);
+  const changed = resolveAutomatedTurns(state);
+  let guard = 0;
+  while (state.pendingDraw && guard < 20) {
+    if (state.pendingDraw.reveal) state.pendingDraw.reveal.resolvesAt = 0;
+    resolvePendingDraw(state);
+    guard += 1;
+  }
+  return changed;
 }
 
 function controlledGame3(absentPlayerAction: "none" | "draw" | "autoplay" = "autoplay"): GameStateInternal {

@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import type {
   Card,
   Color,
+  DrawMode,
+  DrawReason,
   GameLogEntry,
   GameMode,
   GamePhase,
@@ -9,6 +11,7 @@ import type {
   LastStandPlacement,
   PendingBatchPlay,
   PendingFlip,
+  PendingDrawState,
   PauseReason,
   ParticipantRole,
   PendingChallenge,
@@ -23,7 +26,7 @@ import type {
 } from "@congcard/shared";
 import { LIGHT_COLORS, mergeRoomSettings, type FlipSide } from "@congcard/shared";
 import { standardMode, shuffleCards, buildSingleDeck } from "./modes/standard.js";
-import { applyFlipSide, buildFlipDeckBox, flipColors, flipMode, publicCard } from "./modes/flip.js";
+import { applyFlipSide, buildFlipDeckBox, flipColors, flipMode, oppositeCardFace, publicCard, visibleCardFace } from "./modes/flip.js";
 
 // Network-delay buffer so the One/Catch window opens AFTER every player has had
 // a fair chance to receive the snapshot. The delay is calculated dynamically from
@@ -55,6 +58,10 @@ const FLIP_SYNC_MIN_LEAD_MS = 350;
 const FLIP_SYNC_EXTRA_MS = 180;
 const FLIP_STEP_MS = 650;
 const FLIP_SETTLE_MS = 520;
+const DRAW_REVEAL_DURATION_MS = 800;
+const DRAW_REVEAL_FACE_AT_MS = 220;
+const DRAW_NEXT_GAP_MS = 120;
+const DRAW_SYNC_EXTRA_MS = 80;
 
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
@@ -75,6 +82,33 @@ interface DealQueueInternal {
   nextIndex: number;
 }
 
+type DrawContinuation =
+  | { type: "normal"; automated: boolean }
+  | { type: "setDeadline"; offenderId?: string }
+  | { type: "finishWinner"; winnerId: string };
+
+interface PendingDrawInternal {
+  playerId: string;
+  reason: DrawReason;
+  mode: DrawMode;
+  drawnCount: number;
+  remainingCount?: number;
+  totalCount?: number;
+  targetColor?: Color;
+  requiredMatches?: number;
+  matchesFound: number;
+  deadline?: number;
+  reveal?: {
+    id: number;
+    index: number;
+    startsAt: number;
+    revealsAt: number;
+    resolvesAt: number;
+    card: Card;
+  };
+  continuation: DrawContinuation;
+}
+
 export interface GameStateInternal {
   code: string;
   phase: GamePhase;
@@ -90,6 +124,7 @@ export interface GameStateInternal {
   pendingChallenge?: PendingChallenge;
   pendingStack?: PendingStack;
   pendingBatchPlay?: PendingBatchPlayInternal;
+  pendingDraw?: PendingDrawInternal;
   flipSide?: FlipSide;
   pendingFlip?: PendingFlip;
   roundDeal?: RoundDealState;
@@ -109,6 +144,7 @@ export interface GameStateInternal {
   autoPlayPendingAt?: number;
   dealEventSeq: number;
   flipEventSeq: number;
+  drawEventSeq: number;
 }
 
 export class GameError extends Error {
@@ -135,7 +171,8 @@ export function createGame(code: string, settings?: RoomSettingsInput): GameStat
     seq: 0,
     actionLog: [],
     dealEventSeq: 0,
-    flipEventSeq: 0
+    flipEventSeq: 0,
+    drawEventSeq: 0
   };
 }
 
@@ -342,6 +379,9 @@ export function kickPlayer(state: GameStateInternal, hostId: string, targetId: s
   const target = findPlayer(state, targetId);
 
   if (state.phase === "playing") {
+    if (state.pendingDraw) {
+      throw new GameError("draw_in_progress", "Wait for the current draw reveal to finish.");
+    }
     if (
       state.pendingChallenge &&
       (state.pendingChallenge.offenderId === targetId || state.pendingChallenge.challengerId === targetId)
@@ -447,6 +487,7 @@ export function startRound(state: GameStateInternal): void {
   delete state.pendingChallenge;
   delete state.pendingStack;
   delete state.pendingBatchPlay;
+  delete state.pendingDraw;
   delete state.pendingFlip;
   delete state.roundDeal;
   delete state.dealQueue;
@@ -637,7 +678,7 @@ export function resolveRoundDeal(state: GameStateInternal): boolean {
   delete state.dealQueue;
   state.phase = "playing";
   applyOpeningCard(state, event.card);
-  setTurnDeadline(state);
+  if (!state.pendingDraw && !state.pendingFlip) setTurnDeadline(state);
   pushLog(state, "round", `Round ${state.roundNumber} started.`);
   return true;
 }
@@ -744,7 +785,7 @@ export function playCard(
     applyPlayedCard(state, player, card, handBefore, { resetStackFromJumpIn: jumpingIntoStack, prevColor: activeColor });
   }
 
-  if (!state.pendingChallenge && !state.pendingStack && !state.pendingFlip && player.hand.length === 0) {
+  if (!state.pendingChallenge && !state.pendingStack && !state.pendingFlip && !state.pendingDraw && player.hand.length === 0) {
     finishPlayerOrCompleteRound(state, player.id);
   }
 }
@@ -893,7 +934,7 @@ export function resolvePendingBatchPlay(state: GameStateInternal): boolean {
   pushLog(state, "batch", `${player.nickname} played a batch of ${pending.cards.length} ${batchValueLabel(finalCard)} cards.`);
   applyBatchCards(state, player, pending.cards, pending.handBefore, pending.activeColorBefore);
 
-  if (!state.pendingChallenge && !state.pendingStack && !state.pendingFlip && player.hand.length === 0) {
+  if (!state.pendingChallenge && !state.pendingStack && !state.pendingFlip && !state.pendingDraw && player.hand.length === 0) {
     finishPlayerOrCompleteRound(state, player.id);
   }
 
@@ -931,6 +972,7 @@ export function resolvePendingFlip(state: GameStateInternal): boolean {
   state.flipSide = pending.toSide;
   const zones = [state.drawPile, state.discardPile, ...state.players.map((player) => player.hand)];
   if (state.dealQueue) zones.push(state.dealQueue.cards);
+  if (state.pendingDraw?.reveal) zones.push([state.pendingDraw.reveal.card]);
   for (const zone of zones) {
     for (const card of zone) applyFlipSide(card, pending.toSide);
   }
@@ -962,7 +1004,6 @@ export function drawCard(state: GameStateInternal, playerId: string, automated =
   ensureNoPendingBatchPlay(state);
   ensureNotPaused(state);
   ensureNoPendingChallenge(state);
-  const mode = getMode(state.settings);
   const player = currentPlayer(state);
 
   if (player.id !== playerId) {
@@ -984,27 +1025,9 @@ export function drawCard(state: GameStateInternal, playerId: string, automated =
     return;
   }
 
-  const card = takeCard(state);
-  if (!card) {
-    pushLog(state, "draw", `${player.nickname} passed because no cards were left.`);
-    advanceTurn(state);
-    return;
-  }
-
-  player.hand.push(card);
-  syncPlayerHandChange(state, player);
-  player.drawnCardId = card.id;
   player.calledOne = false;
   pushLog(state, "draw", `${player.nickname} drew one card.`);
-
-  const activeColor = state.activeColor;
-  if (!activeColor || !mode.isPlayable(card, { playerId, activeColor, discardTop: topDiscard(state), hand: player.hand, playerCount: activePlayers(state).length })) {
-    if (automated) {
-      return;
-    }
-    delete player.drawnCardId;
-    advanceTurn(state);
-  }
+  queueNormalDraw(state, player, automated);
 }
 
 export function playDrawn(state: GameStateInternal, playerId: string, play: boolean, declaredColor?: Color): void {
@@ -1113,9 +1136,9 @@ export function catchOne(state: GameStateInternal, catcherId: string, targetId: 
 
   // Closing the window is the double-catch guard; the caught player must NOT
   // be credited with a One call they never made.
-  drawMany(state, target, 2);
   closeOneWindowForPlayer(state, target.id);
   pushLog(state, "one", `${catcher.nickname} caught ${target.nickname}.`);
+  queueFixedDraw(state, target, 2, "catch", { type: "setDeadline" });
 }
 
 export function resolvePendingOneCall(state: GameStateInternal): boolean {
@@ -1177,23 +1200,18 @@ export function resolveChallenge(state: GameStateInternal, playerId: string, acc
 
   if (!accept) {
     const totalDraw = challengeableStack?.totalDraw ?? pending.drawCount ?? 4;
-    drawMany(state, challenger, totalDraw);
     state.currentSeat = seatAfter(state, challenger.seat);
     pushLog(state, "challenge", totalDraw === 4 ? `${challenger.nickname} took four cards.` : `${challenger.nickname} took ${totalDraw} cards.`);
+    queueFixedDraw(state, challenger, totalDraw, "challenge", { type: "setDeadline", offenderId: offender.id });
   } else if (pending.guilty) {
-    drawMany(state, offender, pending.drawCount ?? 4);
     state.currentSeat = challenger.seat;
     pushLog(state, "challenge", `${challenger.nickname} won the challenge.`);
+    queueFixedDraw(state, offender, pending.drawCount ?? 4, "challenge", { type: "setDeadline", offenderId: offender.id });
   } else {
-    drawMany(state, challenger, (pending.drawCount ?? 4) + 2);
+    const drawCount = (pending.drawCount ?? 4) + 2;
     state.currentSeat = seatAfter(state, challenger.seat);
-    pushLog(state, "challenge", `${challenger.nickname} lost the challenge and drew ${(pending.drawCount ?? 4) + 2} cards.`);
-  }
-
-  setTurnDeadline(state);
-
-  if (offender.hand.length === 0) {
-    finishPlayerOrCompleteRound(state, offender.id);
+    pushLog(state, "challenge", `${challenger.nickname} lost the challenge and drew ${drawCount} cards.`);
+    queueFixedDraw(state, challenger, drawCount, "challenge", { type: "setDeadline", offenderId: offender.id });
   }
 }
 
@@ -1203,7 +1221,7 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
     return pause.changed;
   }
 
-  if (state.pendingBatchPlay || state.pendingFlip) {
+  if (state.pendingBatchPlay || state.pendingFlip || state.pendingDraw) {
     return false;
   }
 
@@ -1246,12 +1264,12 @@ export function handleTurnTimeout(state: GameStateInternal): boolean {
   if (player.drawnCardId) {
     delete player.drawnCardId;
     pushLog(state, "draw", `${player.nickname} passed after drawing.`);
+    advanceTurn(state);
   } else {
-    drawMany(state, player, 1);
+    state.currentSeat = seatAfter(state, player.seat);
     pushLog(state, "draw", `${player.nickname} timed out and drew one card.`);
+    queueFixedDraw(state, player, 1, "timeout", { type: "setDeadline" });
   }
-
-  advanceTurn(state);
   return true;
 }
 
@@ -1264,7 +1282,7 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
     code: state.code,
     phase: state.phase,
     settings: state.settings,
-    players: sortedPlayers(state).map(toPublicPlayer),
+    players: sortedPlayers(state).map((player) => toPublicPlayer(state, player, playerId)),
     viewers: sortedViewers(state),
     direction: state.direction,
     roundNumber: state.roundNumber,
@@ -1325,12 +1343,20 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
       resolvesAt: pending.resolvesAt
     };
   }
+  if (state.pendingDraw) {
+    snapshot.pendingDraw = publicPendingDraw(state, state.pendingDraw, playerId);
+  }
   if (state.roundDeal) {
     snapshot.roundDeal = publicRoundDeal(state.roundDeal);
   }
 
   if (state.flipSide) {
     snapshot.flipSide = state.flipSide;
+  }
+
+  if (state.settings.modeId === "flip" && state.flipSide && state.phase !== "lobby") {
+    const drawBack = state.drawPile.at(-1) ? oppositeCardFace(state.drawPile.at(-1)!, state.flipSide) : undefined;
+    if (drawBack) snapshot.drawPileBack = drawBack;
   }
 
   if (state.pendingFlip) {
@@ -1382,7 +1408,7 @@ export function resolveAutomatedTurns(state: GameStateInternal): boolean {
   }
 
   let changed = false;
-  if (state.pendingBatchPlay || state.pendingFlip) {
+  if (state.pendingBatchPlay || state.pendingFlip || state.pendingDraw) {
     return changed;
   }
   // Allow extra iterations beyond one-per-player so a chain of auto turns can
@@ -1492,8 +1518,9 @@ function applyOpeningCard(state: GameStateInternal, card: Card): void {
     }
   } else if (card.value === "draw2" || card.value === "draw5") {
     const target = findPlayerBySeat(state, state.currentSeat);
-    drawMany(state, target, card.value === "draw2" ? 2 : 5);
+    const amount = card.value === "draw2" ? 2 : 5;
     state.currentSeat = seatAfter(state, target.seat);
+    queueFixedDraw(state, target, amount, "opening", { type: "setDeadline" });
   } else if (card.value === "flip") {
     scheduleFlip(state, currentPlayer(state).id, 1, true);
   }
@@ -1545,10 +1572,9 @@ function applyBatchCards(
     }
 
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
-    drawMany(state, target, totalDraw);
     state.currentSeat = seatAfter(state, target.seat);
-    setTurnDeadline(state);
     pushLog(state, "draw", `${target.nickname} drew ${totalDraw} cards.`);
+    queueFixedDraw(state, target, totalDraw, "penalty", { type: "setDeadline", offenderId: player.id });
     return;
   }
 
@@ -1576,10 +1602,9 @@ function applyBatchCards(
 
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     if (!state.settings.challengeEnabled) {
-      drawMany(state, target, totalDraw);
       state.currentSeat = seatAfter(state, target.seat);
-      setTurnDeadline(state);
       pushLog(state, "challenge", `${target.nickname} took ${totalDraw} cards.`);
+      queueFixedDraw(state, target, totalDraw, "penalty", { type: "setDeadline", offenderId: player.id });
       return;
     }
 
@@ -1609,10 +1634,8 @@ function applyBatchCards(
       return;
     }
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
-    const drawn = drawUntilColorMatches(state, target, targetColor, count);
     state.currentSeat = seatAfter(state, target.seat);
-    setTurnDeadline(state);
-    pushLog(state, "draw", `${target.nickname} drew ${drawn} cards to find ${count} ${targetColor} card${count === 1 ? "" : "s"}.`);
+    queueColorHunt(state, target, targetColor, count, { type: "setDeadline", offenderId: player.id });
     return;
   }
 
@@ -1695,10 +1718,9 @@ function applyPlayedCard(
     }
 
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
-    drawMany(state, target, amount);
     state.currentSeat = seatAfter(state, target.seat);
-    setTurnDeadline(state);
     pushLog(state, "draw", `${target.nickname} drew ${amount} cards.`);
+    queueFixedDraw(state, target, amount, "penalty", { type: "setDeadline", offenderId: player.id });
     return;
   }
 
@@ -1724,10 +1746,9 @@ function applyPlayedCard(
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     const previousColor = options.prevColor;
     if (!state.settings.challengeEnabled) {
-      drawMany(state, target, amount);
       state.currentSeat = seatAfter(state, target.seat);
-      setTurnDeadline(state);
       pushLog(state, "challenge", `${target.nickname} took ${amount} cards.`);
+      queueFixedDraw(state, target, amount, "penalty", { type: "setDeadline", offenderId: player.id });
       return;
     }
 
@@ -1753,10 +1774,8 @@ function applyPlayedCard(
       return;
     }
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
-    const drawn = drawUntilColorMatches(state, target, targetColor, 1);
     state.currentSeat = seatAfter(state, target.seat);
-    setTurnDeadline(state);
-    pushLog(state, "draw", `${target.nickname} drew ${drawn} cards to find ${targetColor}.`);
+    queueColorHunt(state, target, targetColor, 1, { type: "setDeadline", offenderId: player.id });
     return;
   }
 
@@ -1856,26 +1875,18 @@ function resolveStackDraw(state: GameStateInternal, player: PlayerState): void {
     return;
   }
 
-  if (stack.kind === "wildColor" && stack.targetColor) {
-    const drawn = drawUntilColorMatches(state, player, stack.targetColor, stack.totalDraw);
-    pushLog(state, "draw", `${player.nickname} drew ${drawn} cards to find ${stack.totalDraw} ${stack.targetColor} card${stack.totalDraw === 1 ? "" : "s"}.`);
-  } else {
-    drawMany(state, player, stack.totalDraw);
-    pushLog(state, "draw", `${player.nickname} drew ${stack.totalDraw} stacked cards.`);
-  }
   const winnerId = stack.roundWinnerId;
   delete state.pendingStack;
-  if (winnerId) {
-    finishPlayerOrCompleteRound(state, winnerId);
-    return;
-  }
-
-  if (maybeCompleteLastStandRound(state)) {
-    return;
-  }
-
   state.currentSeat = seatAfter(state, player.seat);
-  setTurnDeadline(state);
+  const continuation: DrawContinuation = winnerId
+    ? { type: "finishWinner", winnerId }
+    : { type: "setDeadline" };
+  if (stack.kind === "wildColor" && stack.targetColor) {
+    queueColorHunt(state, player, stack.targetColor, stack.totalDraw, continuation);
+  } else {
+    pushLog(state, "draw", `${player.nickname} drew ${stack.totalDraw} stacked cards.`);
+    queueFixedDraw(state, player, stack.totalDraw, "penalty", continuation);
+  }
 }
 
 function canStackCard(card: Card, stack: PendingStack): boolean {
@@ -2155,40 +2166,235 @@ function syncPlayerHandChange(state: GameStateInternal, player: PlayerState): vo
   }
 }
 
-// Penalty draws degrade gracefully when every card is already in players'
-// hands: take what is available instead of throwing mid-mutation.
-function drawMany(state: GameStateInternal, player: PlayerState, count: number): void {
-  if (player.finishedRank) {
+function drawSyncLead(state: GameStateInternal): number {
+  const maxPing = Math.max(...state.players.filter((player) => player.connected).map((player) => player.ping), 0);
+  return Math.max(DRAW_NEXT_GAP_MS, Math.ceil(maxPing / 2) + DRAW_SYNC_EXTRA_MS);
+}
+
+function queueNormalDraw(state: GameStateInternal, player: PlayerState, automated: boolean): void {
+  startPendingDraw(state, {
+    playerId: player.id,
+    reason: automated ? "autoplay" : "turn",
+    mode: "auto",
+    drawnCount: 0,
+    remainingCount: 1,
+    totalCount: 1,
+    matchesFound: 0,
+    continuation: { type: "normal", automated }
+  });
+}
+
+function queueFixedDraw(
+  state: GameStateInternal,
+  player: PlayerState,
+  count: number,
+  reason: DrawReason,
+  continuation: DrawContinuation
+): void {
+  if (player.finishedRank || count <= 0) {
+    completeDrawContinuation(state, continuation, player);
+    return;
+  }
+  startPendingDraw(state, {
+    playerId: player.id,
+    reason,
+    mode: "auto",
+    drawnCount: 0,
+    remainingCount: count,
+    totalCount: count,
+    matchesFound: 0,
+    continuation
+  });
+}
+
+function queueColorHunt(
+  state: GameStateInternal,
+  player: PlayerState,
+  targetColor: Color,
+  requiredMatches: number,
+  continuation: DrawContinuation
+): void {
+  const automatic = !player.connected || player.away;
+  startPendingDraw(state, {
+    playerId: player.id,
+    reason: "colorHunt",
+    mode: automatic ? "auto" : "choice",
+    drawnCount: 0,
+    targetColor,
+    requiredMatches,
+    matchesFound: 0,
+    deadline: Date.now() + state.settings.turnTimeoutSec * 1000,
+    continuation
+  });
+}
+
+function startPendingDraw(state: GameStateInternal, pending: PendingDrawInternal): void {
+  if (state.pendingDraw) {
+    throw new GameError("draw_in_progress", "A draw reveal is already in progress.");
+  }
+  state.pendingDraw = pending;
+  if (pending.continuation.type === "setDeadline" && pending.continuation.offenderId) {
+    closeOneWindowForPlayer(state, pending.continuation.offenderId);
+  }
+  delete state.turnDeadline;
+  delete state.autoPlayPendingAt;
+  if (pending.mode === "auto") {
+    scheduleNextPendingDraw(state);
+  }
+}
+
+function scheduleNextPendingDraw(state: GameStateInternal): void {
+  const pending = state.pendingDraw;
+  if (!pending || pending.reveal) return;
+  const card = takeCard(state);
+  if (!card) {
+    pushLog(state, "round", "The draw pile ran out of cards.");
+    finishPendingDraw(state);
+    return;
+  }
+  const startsAt = Date.now() + drawSyncLead(state);
+  state.drawEventSeq += 1;
+  pending.reveal = {
+    id: state.drawEventSeq,
+    index: pending.drawnCount + 1,
+    startsAt,
+    revealsAt: startsAt + DRAW_REVEAL_FACE_AT_MS,
+    resolvesAt: startsAt + DRAW_REVEAL_DURATION_MS,
+    card
+  };
+}
+
+export function chooseColorDraw(state: GameStateInternal, playerId: string, mode: Exclude<DrawMode, "choice">): void {
+  ensurePlaying(state);
+  const pending = state.pendingDraw;
+  if (!pending || pending.reason !== "colorHunt" || pending.playerId !== playerId || pending.mode !== "choice") {
+    throw new GameError("color_draw_unavailable", "There is no Wild Draw Color choice for this player.");
+  }
+  const player = findPlayer(state, playerId);
+  ensurePlayerInteractive(player);
+  pending.mode = mode;
+  if (mode === "auto") scheduleNextPendingDraw(state);
+}
+
+export function drawColorCard(state: GameStateInternal, playerId: string): void {
+  ensurePlaying(state);
+  const pending = state.pendingDraw;
+  if (!pending || pending.reason !== "colorHunt" || pending.playerId !== playerId || pending.mode !== "manual" || pending.reveal) {
+    throw new GameError("color_draw_unavailable", "Manual Wild Draw Color is not ready.");
+  }
+  ensurePlayerInteractive(findPlayer(state, playerId));
+  scheduleNextPendingDraw(state);
+}
+
+export function resolvePendingDraw(state: GameStateInternal): boolean {
+  const pending = state.pendingDraw;
+  if (!pending) return false;
+  const now = Date.now();
+
+  if (!pending.reveal) {
+    const target = findPlayer(state, pending.playerId);
+    if ((pending.mode === "choice" || pending.mode === "manual") && (!target.connected || target.away)) {
+      pending.mode = "auto";
+      scheduleNextPendingDraw(state);
+      return true;
+    }
+    if ((pending.mode === "choice" || pending.mode === "manual") && pending.deadline && now >= pending.deadline) {
+      pending.mode = "auto";
+      scheduleNextPendingDraw(state);
+      return true;
+    }
+    if (pending.mode === "auto") {
+      scheduleNextPendingDraw(state);
+      return true;
+    }
+    return false;
+  }
+
+  if (now < pending.reveal.resolvesAt) return false;
+  const player = findPlayer(state, pending.playerId);
+  const card = pending.reveal.card;
+  player.hand.push(card);
+  pending.drawnCount += 1;
+  if (pending.remainingCount !== undefined) pending.remainingCount -= 1;
+  if (pending.targetColor && card.color === pending.targetColor) pending.matchesFound += 1;
+  if (pending.reason === "turn" || pending.reason === "autoplay") player.drawnCardId = card.id;
+  delete pending.reveal;
+  syncPlayerHandChange(state, player);
+
+  const fixedComplete = pending.remainingCount !== undefined && pending.remainingCount <= 0;
+  const colorComplete =
+    pending.reason === "colorHunt" &&
+    (pending.matchesFound >= (pending.requiredMatches ?? 1) || pending.drawnCount >= 600);
+  if (fixedComplete || colorComplete) {
+    finishPendingDraw(state);
+  } else if (pending.mode === "auto") {
+    scheduleNextPendingDraw(state);
+  }
+  return true;
+}
+
+function finishPendingDraw(state: GameStateInternal): void {
+  const pending = state.pendingDraw;
+  if (!pending) return;
+  const player = findPlayer(state, pending.playerId);
+  const continuation = pending.continuation;
+  if (pending.reason === "colorHunt" && pending.targetColor) {
+    pushLog(
+      state,
+      "draw",
+      `${player.nickname} drew ${pending.drawnCount} cards to find ${pending.requiredMatches ?? 1} ${pending.targetColor} card${(pending.requiredMatches ?? 1) === 1 ? "" : "s"}.`
+    );
+  }
+  delete state.pendingDraw;
+  completeDrawContinuation(state, continuation, player);
+}
+
+function completeDrawContinuation(state: GameStateInternal, continuation: DrawContinuation, player: PlayerState): void {
+  if (continuation.type === "finishWinner") {
+    finishPlayerOrCompleteRound(state, continuation.winnerId);
+    return;
+  }
+  if (continuation.type === "normal") {
+    const drawn = player.drawnCardId ? player.hand.find((card) => card.id === player.drawnCardId) : undefined;
+    if (!drawn) {
+      advanceTurn(state);
+      return;
+    }
+    if (continuation.automated) {
+      state.autoPlayPendingAt = Date.now();
+      setTurnDeadline(state);
+      return;
+    }
+    const activeColor = state.activeColor;
+    const playable = Boolean(
+      activeColor &&
+        getMode(state.settings).isPlayable(drawn, {
+          playerId: player.id,
+          activeColor,
+          discardTop: topDiscard(state),
+          hand: player.hand,
+          playerCount: activePlayers(state).length
+        })
+    );
+    if (playable) {
+      setTurnDeadline(state);
+    } else {
+      delete player.drawnCardId;
+      advanceTurn(state);
+    }
     return;
   }
 
-  for (let index = 0; index < count; index += 1) {
-    const card = takeCard(state);
-    if (!card) {
-      pushLog(state, "round", "The draw pile ran out of cards.");
-      break;
+  if (continuation.offenderId) {
+    const offender = findPlayer(state, continuation.offenderId);
+    if (offender.hand.length === 0) {
+      finishPlayerOrCompleteRound(state, offender.id);
+      return;
     }
-
-    player.hand.push(card);
+    updateOneWindowAfterPlay(state, offender);
   }
-
-  syncPlayerHandChange(state, player);
-}
-
-function drawUntilColorMatches(state: GameStateInternal, player: PlayerState, targetColor: Color, requiredMatches: number): number {
-  if (player.finishedRank) return 0;
-  let drawn = 0;
-  let matches = 0;
-  const safetyLimit = 600;
-  while (matches < requiredMatches && drawn < safetyLimit) {
-    const card = takeCard(state);
-    if (!card) break;
-    player.hand.push(card);
-    drawn += 1;
-    if (card.color === targetColor) matches += 1;
-  }
-  syncPlayerHandChange(state, player);
-  return drawn;
+  if (maybeCompleteLastStandRound(state)) return;
+  if (state.phase === "playing") setTurnDeadline(state);
 }
 
 function takeCard(state: GameStateInternal): Card | undefined {
@@ -2206,7 +2412,12 @@ function takeCard(state: GameStateInternal): Card | undefined {
 // Every card can end up in players' hands with nothing left to recycle from.
 // Add a fresh mode-specific box with a unique deck index instead of stalling.
 function addFreshDeck(state: GameStateInternal): void {
-  const inPlay = [...state.drawPile, ...state.discardPile, ...state.players.flatMap((player) => player.hand)];
+  const inPlay = [
+    ...state.drawPile,
+    ...state.discardPile,
+    ...state.players.flatMap((player) => player.hand),
+    ...(state.pendingDraw?.reveal ? [state.pendingDraw.reveal.card] : [])
+  ];
   const nextDeckIndex = inPlay.reduce((max, item) => Math.max(max, item.deckIndex), -1) + 1;
 
   const fresh = state.settings.modeId === "flip" ? buildFlipDeckBox(nextDeckIndex) : buildSingleDeck(nextDeckIndex);
@@ -2437,7 +2648,53 @@ function publicRoundDeal(deal: RoundDealState): RoundDealState {
   return { ...deal, event: { ...deal.event, card: publicCard(deal.event.card) } };
 }
 
-function toPublicPlayer(player: PlayerState): PublicPlayer {
+function publicPendingDraw(state: GameStateInternal, pending: PendingDrawInternal, viewerId?: string): PendingDrawState {
+  const reveal = pending.reveal;
+  const visible = reveal
+    ? viewerId === pending.playerId
+      ? visibleCardFace(reveal.card)
+      : state.settings.modeId === "flip" && state.flipSide
+        ? oppositeCardFace(reveal.card, state.flipSide)
+        : undefined
+    : undefined;
+  return {
+    playerId: pending.playerId,
+    reason: pending.reason,
+    mode: pending.mode,
+    drawnCount: pending.drawnCount,
+    ...(pending.totalCount !== undefined ? { totalCount: pending.totalCount } : {}),
+    ...(pending.targetColor ? { targetColor: pending.targetColor } : {}),
+    ...(pending.requiredMatches !== undefined ? { requiredMatches: pending.requiredMatches } : {}),
+    ...(pending.reason === "colorHunt" ? { matchesFound: pending.matchesFound } : {}),
+    ...(pending.deadline ? { deadline: pending.deadline } : {}),
+    ...(reveal
+      ? {
+          reveal: {
+            id: reveal.id,
+            index: reveal.index,
+            startsAt: reveal.startsAt,
+            revealsAt: reveal.revealsAt,
+            resolvesAt: reveal.resolvesAt,
+            ...(visible
+              ? { visibleCard: { color: visible.color, value: visible.value, ...(visible.side ? { side: visible.side } : {}) } }
+              : {})
+          }
+        }
+      : {})
+  };
+}
+
+function toPublicPlayer(state: GameStateInternal, player: PlayerState, viewerId?: string): PublicPlayer {
+  const oppositeHand =
+    state.settings.modeId === "flip" &&
+    state.phase === "playing" &&
+    state.flipSide &&
+    viewerId !== player.id
+      ? player.hand.flatMap((card) => {
+          const face = oppositeCardFace(card, state.flipSide!);
+          return face ? [face] : [];
+        })
+      : undefined;
   return {
     id: player.id,
     nickname: player.nickname,
@@ -2453,6 +2710,7 @@ function toPublicPlayer(player: PlayerState): PublicPlayer {
     autoPlay: player.autoPlay,
     missedDisconnectedTurns: player.missedDisconnectedTurns,
     ping: player.ping,
+    ...(oppositeHand ? { oppositeHand } : {}),
     ...(player.finishedRank ? { finishedRank: player.finishedRank } : {})
   };
 }
@@ -2547,6 +2805,20 @@ function rebindPlayerSession(state: GameStateInternal, oldId: string, newId: str
 
   if (state.pendingBatchPlay?.playerId === oldId) {
     state.pendingBatchPlay.playerId = newId;
+  }
+
+  if (state.pendingDraw?.playerId === oldId) {
+    state.pendingDraw.playerId = newId;
+  }
+  if (state.pendingDraw?.continuation.type === "setDeadline" && state.pendingDraw.continuation.offenderId === oldId) {
+    state.pendingDraw.continuation.offenderId = newId;
+  }
+  if (state.pendingDraw?.continuation.type === "finishWinner" && state.pendingDraw.continuation.winnerId === oldId) {
+    state.pendingDraw.continuation.winnerId = newId;
+  }
+
+  if (state.pendingFlip?.playerId === oldId) {
+    state.pendingFlip.playerId = newId;
   }
 
   if (state.roundDeal?.dealerPlayerId === oldId) {
@@ -2829,7 +3101,7 @@ function randomColor(state: GameStateInternal): Color {
 }
 
 function setTurnDeadline(state: GameStateInternal): void {
-  if (state.pendingBatchPlay || state.pendingFlip) {
+  if (state.pendingBatchPlay || state.pendingFlip || state.pendingDraw) {
     delete state.turnDeadline;
     return;
   }
@@ -2941,6 +3213,9 @@ function ensureNoPendingBatchPlay(state: GameStateInternal): void {
   }
   if (state.pendingFlip) {
     throw new GameError("flip_in_progress", "Wait for the current Flip transition to finish.");
+  }
+  if (state.pendingDraw) {
+    throw new GameError("draw_in_progress", "Wait for the current draw reveal to finish.");
   }
 }
 

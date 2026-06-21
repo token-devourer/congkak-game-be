@@ -142,7 +142,11 @@ describe("synchronized round dealing", () => {
     }
     finishAutomaticDeal(state);
 
-    const total = state.drawPile.length + state.discardPile.length + state.players.reduce((sum, player) => sum + player.hand.length, 0);
+    const total =
+      state.drawPile.length +
+      state.discardPile.length +
+      state.players.reduce((sum, player) => sum + player.hand.length, 0) +
+      (state.pendingDraw?.reveal ? 1 : 0);
     expect(total).toBe(108);
   });
 });

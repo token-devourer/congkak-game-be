@@ -1,6 +1,7 @@
 import { Client, Room } from "@colyseus/core";
 import {
   challengeSchema,
+  chooseColorDrawSchema,
   catchOneSchema,
   dealCardSchema,
   emoteSchema,
@@ -19,8 +20,10 @@ import {
   beginManualDeal,
   callOne,
   catchOne,
+  chooseColorDraw,
   createGame,
   drawCard,
+  drawColorCard,
   dealRoundCard,
   expireOneWindow,
   GameError,
@@ -34,6 +37,7 @@ import {
   resolveAutomatedTurns,
   resolvePendingBatchPlay,
   resolvePendingFlip,
+  resolvePendingDraw,
   resolveRoundDeal,
   resolvePendingOneCall,
   sendEmote,
@@ -79,6 +83,7 @@ export class GameRoom extends Room {
         const dealChanged = resolveRoundDeal(this.game);
         const batchResolved = resolvePendingBatchPlay(this.game);
         const flipResolved = resolvePendingFlip(this.game);
+        const drawResolved = resolvePendingDraw(this.game);
         const oneCallResolved = resolvePendingOneCall(this.game);
         const windowClosed = expireOneWindow(this.game);
         const autoPlayedBeforeTimeout = resolveAutomatedTurns(this.game);
@@ -88,6 +93,7 @@ export class GameRoom extends Room {
           dealChanged ||
           batchResolved ||
           flipResolved ||
+          drawResolved ||
           oneCallResolved ||
           windowClosed ||
           autoPlayedBeforeTimeout ||
@@ -171,6 +177,17 @@ export class GameRoom extends Room {
 
     this.onMessage("game.drawCard", (client) => this.safe(client, () => {
       drawCard(this.game, client.sessionId);
+      this.broadcastState();
+    }));
+
+    this.onMessage("game.chooseColorDraw", (client, message) => this.safe(client, () => {
+      const payload = chooseColorDrawSchema.parse(message);
+      chooseColorDraw(this.game, client.sessionId, payload.mode);
+      this.broadcastState();
+    }));
+
+    this.onMessage("game.drawColorCard", (client) => this.safe(client, () => {
+      drawColorCard(this.game, client.sessionId);
       this.broadcastState();
     }));
 

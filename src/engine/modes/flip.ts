@@ -1,4 +1,5 @@
-import type { Card, CardValue, Color, FlipSide, GameMode, TurnContext } from "@congcard/shared";
+import { randomBytes } from "node:crypto";
+import type { Card, CardValue, Color, FlipSide, GameMode, OpponentCardFace, TurnContext, VisibleCardFace } from "@congcard/shared";
 import { DARK_COLORS, LIGHT_COLORS } from "@congcard/shared";
 import { shuffleCards } from "./standard.js";
 
@@ -9,6 +10,7 @@ interface FlipFace {
 
 export interface FlipCardInternal extends Card {
   flipFaces?: Record<FlipSide, FlipFace>;
+  trackingId?: string;
 }
 
 const DARK_FOR_LIGHT: Record<(typeof LIGHT_COLORS)[number], (typeof DARK_COLORS)[number]> = {
@@ -18,8 +20,20 @@ const DARK_FOR_LIGHT: Record<(typeof LIGHT_COLORS)[number], (typeof DARK_COLORS)
   blue: "pink"
 };
 
-function pairedCard(id: string, deckIndex: number, light: FlipFace, dark: FlipFace): FlipCardInternal {
-  return { id, deckIndex, color: light.color, value: light.value, side: "light", flipFaces: { light, dark } };
+function opaqueId(prefix: string): string {
+  return `${prefix}-${randomBytes(12).toString("base64url")}`;
+}
+
+function pairedCard(deckIndex: number, light: FlipFace, dark: FlipFace): FlipCardInternal {
+  return {
+    id: opaqueId("flip"),
+    trackingId: opaqueId("back"),
+    deckIndex,
+    color: light.color,
+    value: light.value,
+    side: "light",
+    flipFaces: { light, dark }
+  };
 }
 
 export function buildFlipDeckBox(deckIndex: number): Card[] {
@@ -27,12 +41,11 @@ export function buildFlipDeckBox(deckIndex: number): Card[] {
 
   for (const lightColor of LIGHT_COLORS) {
     const darkColor = DARK_FOR_LIGHT[lightColor];
-    cards.push(pairedCard(`${deckIndex}-flip-${lightColor}-0-0`, deckIndex, { color: lightColor, value: 0 }, { color: darkColor, value: 0 }));
+    cards.push(pairedCard(deckIndex, { color: lightColor, value: 0 }, { color: darkColor, value: 0 }));
     for (let value = 1; value <= 9; value += 1) {
       for (let copy = 0; copy < 2; copy += 1) {
         cards.push(
           pairedCard(
-            `${deckIndex}-flip-${lightColor}-${value}-${copy}`,
             deckIndex,
             { color: lightColor, value: value as CardValue },
             { color: darkColor, value: value as CardValue }
@@ -51,7 +64,6 @@ export function buildFlipDeckBox(deckIndex: number): Card[] {
       for (let copy = 0; copy < 2; copy += 1) {
         cards.push(
           pairedCard(
-            `${deckIndex}-flip-${lightColor}-${lightValue}-${copy}`,
             deckIndex,
             { color: lightColor, value: lightValue },
             { color: darkColor, value: darkValue }
@@ -62,8 +74,8 @@ export function buildFlipDeckBox(deckIndex: number): Card[] {
   }
 
   for (let copy = 0; copy < 4; copy += 1) {
-    cards.push(pairedCard(`${deckIndex}-flip-wild-${copy}`, deckIndex, { color: null, value: "wild" }, { color: null, value: "wild" }));
-    cards.push(pairedCard(`${deckIndex}-flip-wild-draw-${copy}`, deckIndex, { color: null, value: "wild3" }, { color: null, value: "wildColor" }));
+    cards.push(pairedCard(deckIndex, { color: null, value: "wild" }, { color: null, value: "wild" }));
+    cards.push(pairedCard(deckIndex, { color: null, value: "wild3" }, { color: null, value: "wildColor" }));
   }
 
   return cards;
@@ -79,6 +91,22 @@ export function applyFlipSide(card: Card, side: FlipSide): void {
 
 export function publicCard(card: Card): Card {
   return { id: card.id, color: card.color, value: card.value, deckIndex: card.deckIndex, ...(card.side ? { side: card.side } : {}) };
+}
+
+export function visibleCardFace(card: Card): VisibleCardFace {
+  return { color: card.color, value: card.value, ...(card.side ? { side: card.side } : {}) };
+}
+
+export function oppositeCardFace(card: Card, activeSide: FlipSide): OpponentCardFace | undefined {
+  const internal = card as FlipCardInternal;
+  const face = internal.flipFaces?.[activeSide === "light" ? "dark" : "light"];
+  if (!face || !internal.trackingId) return undefined;
+  return {
+    trackingId: internal.trackingId,
+    color: face.color,
+    value: face.value,
+    side: activeSide === "light" ? "dark" : "light"
+  };
 }
 
 export function flipColors(side: FlipSide): readonly Color[] {

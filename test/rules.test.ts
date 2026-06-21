@@ -6,8 +6,10 @@ import {
   addPlayer,
   callOne,
   catchOne,
+  chooseColorDraw,
   createGame,
   drawCard,
+  drawColorCard,
   expireOneWindow,
   handleTurnTimeout,
   playBatch,
@@ -16,6 +18,7 @@ import {
   resolveChallenge,
   resolvePendingBatchPlay,
   resolvePendingFlip,
+  resolvePendingDraw,
   resolvePendingOneCall,
   resolveRoundDeal,
   setPlayerAway,
@@ -26,6 +29,19 @@ import {
   updateSettings,
   type GameStateInternal
 } from "../src/engine/game.js";
+
+function settlePendingDraw(state: GameStateInternal): void {
+  if (state.pendingDraw?.mode === "choice") {
+    chooseColorDraw(state, state.pendingDraw.playerId, "auto");
+  }
+  let guard = 0;
+  while (state.pendingDraw && guard < 700) {
+    if (state.pendingDraw.reveal) state.pendingDraw.reveal.resolvesAt = 0;
+    resolvePendingDraw(state);
+    guard += 1;
+  }
+  if (state.pendingDraw) throw new Error("Pending draw did not settle");
+}
 
 function flipCard(deck: Card[], color: Card["color"], value: Card["value"]): Card {
   const index = deck.findIndex((item) => item.color === color && item.value === value);
@@ -59,6 +75,42 @@ describe("flip mode", () => {
     state.players[0]!.hand = [flipCard(state.drawPile, "red", "flip")];
     expect(snapshotFor(state, "p1").self?.hand[0]).toEqual(expect.objectContaining({ color: "red", value: "flip" }));
     expect(snapshotFor(state, "p1").self?.hand[0]).not.toHaveProperty("flipFaces");
+  });
+
+  it("uses opaque card identifiers and exposes only inactive opponent faces", () => {
+    const state = controlledFlipGame();
+    const held = flipCard(state.drawPile, "red", 7);
+    state.players[0]!.hand = [held];
+    const internal = held as Card & { trackingId?: string; flipFaces?: { dark: Pick<Card, "color" | "value"> } };
+
+    expect(held.id).toMatch(/^flip-[A-Za-z0-9_-]{16}$/);
+    expect(internal.trackingId).toBeTruthy();
+    expect(internal.trackingId).not.toBe(held.id);
+    expect(snapshotFor(state, "p1").players[0]!.oppositeHand).toBeUndefined();
+    expect(snapshotFor(state, "p2").players[0]!.oppositeHand).toEqual([
+      expect.objectContaining({ trackingId: internal.trackingId, ...internal.flipFaces!.dark })
+    ]);
+    expect(snapshotFor(state, "spectator").players[0]!.oppositeHand).toHaveLength(1);
+  });
+
+  it("stages a personalized draw reveal and preserves its public tracking id", () => {
+    const state = controlledFlipGame();
+    state.players[0]!.hand = [flipCard(state.drawPile, "red", 1)];
+    const drawn = flipCard(state.drawPile, "blue", 7);
+    const internal = drawn as Card & { trackingId?: string; flipFaces?: { dark: Pick<Card, "color" | "value"> } };
+    state.drawPile = [drawn];
+    const publicBack = snapshotFor(state, "p2").drawPileBack;
+
+    drawCard(state, "p1");
+    expect(state.players[0]!.hand).toHaveLength(1);
+    expect(snapshotFor(state, "p1").pendingDraw?.reveal?.visibleCard).toMatchObject({ color: "blue", value: 7, side: "light" });
+    expect(snapshotFor(state, "p2").pendingDraw?.reveal?.visibleCard).toMatchObject(internal.flipFaces!.dark);
+    expect(snapshotFor(state, "spectator").pendingDraw?.reveal?.visibleCard).toMatchObject(internal.flipFaces!.dark);
+
+    settlePendingDraw(state);
+    expect(state.players[0]!.hand).toHaveLength(2);
+    expect(snapshotFor(state, "p2").players[0]!.oppositeHand?.at(-1)?.trackingId).toBe(publicBack?.trackingId);
+    expect(publicBack?.trackingId).toBe(internal.trackingId);
   });
 
   it("synchronously flips every card zone and advances after resolution", () => {
@@ -112,8 +164,53 @@ describe("flip mode", () => {
     ];
     playCard(dark, "p1", dark.players[0]!.hand[0]!.id, "cyan");
     expect(dark.pendingChallenge).toBeUndefined();
+    expect(dark.pendingDraw).toMatchObject({ playerId: "p2", reason: "colorHunt", mode: "choice", requiredMatches: 1 });
+    settlePendingDraw(dark);
     expect(dark.players[1]!.hand).toHaveLength(2);
     expect(snapshotFor(dark).currentPlayerId).toBe("p3");
+  });
+
+  it("keeps one deadline while manually revealing Wild Color cards", () => {
+    const state = controlledFlipGame();
+    state.flipSide = "dark";
+    for (const card of [...state.drawPile, ...state.discardPile]) applyFlipSide(card, "dark");
+    state.activeColor = "orange";
+    state.players[0]!.hand = [flipCard(state.drawPile, null, "wildColor"), flipCard(state.drawPile, "orange", 1)];
+    const match = flipCard(state.drawPile, "cyan", 2);
+    const miss = flipCard(state.drawPile, "purple", 3);
+    state.drawPile = [match, miss];
+
+    playCard(state, "p1", state.players[0]!.hand[0]!.id, "cyan");
+    const deadline = state.pendingDraw?.deadline;
+    chooseColorDraw(state, "p2", "manual");
+    drawColorCard(state, "p2");
+    expect(() => drawColorCard(state, "p2")).toThrow("not ready");
+    state.pendingDraw!.reveal!.resolvesAt = 0;
+    resolvePendingDraw(state);
+    expect(state.pendingDraw).toMatchObject({ mode: "manual", drawnCount: 1, matchesFound: 0, deadline });
+
+    drawColorCard(state, "p2");
+    state.pendingDraw!.reveal!.resolvesAt = 0;
+    resolvePendingDraw(state);
+    expect(state.pendingDraw).toBeUndefined();
+    expect(state.players[1]!.hand).toHaveLength(2);
+    expect(snapshotFor(state).currentPlayerId).toBe("p3");
+  });
+
+  it("switches an idle Wild Color choice to automatic drawing", () => {
+    const state = controlledFlipGame();
+    state.flipSide = "dark";
+    for (const card of [...state.drawPile, ...state.discardPile]) applyFlipSide(card, "dark");
+    state.activeColor = "orange";
+    state.players[0]!.hand = [flipCard(state.drawPile, null, "wildColor"), flipCard(state.drawPile, "orange", 1)];
+    state.drawPile = [flipCard(state.drawPile, "cyan", 2), flipCard(state.drawPile, "purple", 3)];
+
+    playCard(state, "p1", state.players[0]!.hand[0]!.id, "cyan");
+    state.pendingDraw!.deadline = Date.now() - 1;
+    expect(resolvePendingDraw(state)).toBe(true);
+    expect(state.pendingDraw).toMatchObject({ mode: "auto" });
+    settlePendingDraw(state);
+    expect(state.players[1]!.hand).toHaveLength(2);
   });
 
   it("accumulates one dark target color across Batch and Stacking", () => {
@@ -195,6 +292,32 @@ function finishAutomaticDeal(state: GameStateInternal): void {
 }
 
 describe("standard mode", () => {
+  it("reveals a staged normal draw only to its recipient", () => {
+    const state = controlledGame();
+    const top = state.drawPile.at(-1)!;
+
+    drawCard(state, "p1");
+
+    expect(snapshotFor(state, "p1").pendingDraw?.reveal?.visibleCard).toMatchObject({ color: top.color, value: top.value });
+    expect(snapshotFor(state, "p2").pendingDraw?.reveal?.visibleCard).toBeUndefined();
+    expect(state.players[0]!.hand).toHaveLength(0);
+    settlePendingDraw(state);
+    expect(state.players[0]!.hand).toHaveLength(1);
+  });
+
+  it("opens the offender One window only after a draw penalty lands", () => {
+    const state = controlledGame();
+    state.players[0]!.hand = [card("red-draw2", "red", "draw2"), card("blue-1", "blue", 1)];
+    state.players[1]!.hand = [card("green-8", "green", 8)];
+
+    playCard(state, "p1", "red-draw2");
+    expect(state.pendingDraw).toBeDefined();
+    expect(state.oneWindow).toBeUndefined();
+
+    settlePendingDraw(state);
+    expect(state.oneWindow?.playerId).toBe("p1");
+  });
+
   it("builds a 108 card deck for standard player counts", () => {
     const deck = standardMode.buildDeck(10);
     const wilds = deck.filter((item) => item.color === null);
@@ -245,6 +368,7 @@ describe("standard mode", () => {
     expect(resolvePendingOneCall(state)).toBe(true);
 
     resolveChallenge(state, "p2", true);
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(5);
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
@@ -260,6 +384,7 @@ describe("standard mode", () => {
     state.oneWindow!.deadline = Date.now() + 1000;
 
     catchOne(state, "p2", "p1");
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(3);
     expect(state.oneWindow).toBeUndefined();
@@ -293,6 +418,7 @@ describe("standard mode", () => {
     state.oneWindow!.deadline = Date.now() + 1000;
     callOne(state, "p1");
     catchOne(state, "p2", "p1");
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(3);
     expect(state.players[0]!.calledOne).toBe(false);
@@ -375,6 +501,7 @@ describe("standard mode", () => {
     state.oneWindow!.opensAt = Date.now() - 1;
     state.oneWindow!.deadline = Date.now() + 1000;
     expect(() => catchOne(state, "p2", "p1")).not.toThrow();
+    settlePendingDraw(state);
     expect(state.players[0]!.hand).toHaveLength(3);
     expect(state.oneWindow).toBeUndefined();
   });
@@ -411,6 +538,7 @@ describe("standard mode", () => {
     state.oneWindow!.opensAt = Date.now() - 1;
     state.oneWindow!.deadline = Date.now() + 1000;
     catchOne(state, "p2", "p1");
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(3);
     expect(state.players[0]!.calledOne).toBe(false);
@@ -453,6 +581,7 @@ describe("standard mode", () => {
     state.oneWindow!.deadline = Date.now() - 1;
 
     playCard(state, "p2", "red-draw2");
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(3);
     expect(state.oneWindow).toBeUndefined();
@@ -494,6 +623,7 @@ describe("standard mode", () => {
     state.discardPile = [card("top", "red", 5)];
 
     drawCard(state, "p1");
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(2);
     expect(state.drawPile).toHaveLength(107);
@@ -508,6 +638,7 @@ describe("standard mode", () => {
     state.discardPile = [card("top", "red", 5)];
 
     drawCard(state, "p1");
+    settlePendingDraw(state);
 
     const drawn = state.players[0]!.hand[1]!;
     expect(drawn.deckIndex).toBe(1);
@@ -524,6 +655,7 @@ describe("standard mode", () => {
     // Only one card is recoverable (the buried "top"); the second penalty
     // card must come from a freshly opened deck instead of being dropped.
     playCard(state, "p1", "draw2");
+    settlePendingDraw(state);
 
     expect(state.players[1]!.hand).toHaveLength(3);
     expect(snapshotFor(state).currentPlayerId).toBe("p1");
@@ -542,6 +674,7 @@ describe("standard mode", () => {
 
     state.oneWindow!.deadline = Date.now() - 1;
     expect(handleTurnTimeout(state)).toBe(true);
+    settlePendingDraw(state);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(5);
@@ -560,11 +693,13 @@ describe("standard mode", () => {
 
     state.autoPlayPendingAt = Date.now() - 2000;
     expect(resolveAutomatedTurns(state)).toBe(true);
+    settlePendingDraw(state);
     expect(state.players[0]!.hand).toHaveLength(handSize + 1);
     expect(snapshotFor(state).currentPlayerId).toBe("p1");
 
     state.autoPlayPendingAt = Date.now() - 2000;
     expect(resolveAutomatedTurns(state)).toBe(true);
+    settlePendingDraw(state);
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
   });
 
@@ -580,6 +715,7 @@ describe("standard mode", () => {
     state.autoPlayPendingAt = Date.now() - 2000;
 
     expect(resolveAutomatedTurns(state)).toBe(true);
+    settlePendingDraw(state);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(5);
@@ -598,11 +734,13 @@ describe("standard mode", () => {
     expect(state.players[0]!).toMatchObject({ connected: true, away: true, autoPlay: true });
     state.autoPlayPendingAt = Date.now() - 2000;
     expect(resolveAutomatedTurns(state)).toBe(true);
+    settlePendingDraw(state);
     expect(state.players[0]!.hand).toHaveLength(2);
     expect(snapshotFor(state).currentPlayerId).toBe("p1");
 
     state.autoPlayPendingAt = Date.now() - 2000;
     expect(resolveAutomatedTurns(state)).toBe(true);
+    settlePendingDraw(state);
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
 
     setPlayerAway(state, "p1", false);
@@ -621,6 +759,7 @@ describe("standard mode", () => {
     state.autoPlayPendingAt = Date.now() - 2000;
 
     expect(resolveAutomatedTurns(state)).toBe(true);
+    settlePendingDraw(state);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(5);
@@ -634,6 +773,7 @@ describe("standard mode", () => {
     state.players[1]!.hand = [card("blue-8", "blue", 8)];
 
     playCard(state, "p1", "wild4", "green");
+    settlePendingDraw(state);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(5);
@@ -711,6 +851,7 @@ describe("standard mode", () => {
 
     playCard(state, "p1", "p1-red-1");
     playCard(state, "p2", "p2-red-draw2");
+    settlePendingDraw(state);
 
     expect(state.players[0]!.hand).toHaveLength(0);
     expect(state.players[2]!.hand).toHaveLength(3);
@@ -730,6 +871,7 @@ describe("standard mode", () => {
     expect(state.players[0]!.finishedRank).toBeUndefined();
 
     resolveChallenge(state, "p2", true);
+    settlePendingDraw(state);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[0]!.finishedRank).toBe(1);
@@ -750,6 +892,7 @@ describe("standard mode", () => {
     expect(state.pendingStack).toMatchObject({ targetPlayerId: "p2", totalDraw: 2 });
 
     playCard(state, "p2", "p2-blue-draw2");
+    settlePendingDraw(state);
 
     expect(state.players[1]!.finishedRank).toBe(2);
     expect(state.phase).toBe("roundEnd");
@@ -866,7 +1009,8 @@ describe("standard mode", () => {
     const totalCards =
       state.drawPile.length +
       state.discardPile.length +
-      state.players.reduce((sum, player) => sum + player.hand.length, 0);
+      state.players.reduce((sum, player) => sum + player.hand.length, 0) +
+      (state.pendingDraw?.reveal ? 1 : 0);
     expect(totalCards).toBe(216);
     expect(state.players.every((player) => player.hand.length >= 7)).toBe(true);
   });
@@ -904,6 +1048,7 @@ describe("standard mode", () => {
     callOne(state, "p2");
     state.pendingOneCall!.resolvesAt = Date.now() - 1;
     expect(resolvePendingOneCall(state)).toBe(true);
+    settlePendingDraw(state);
 
     expect(state.pendingStack).toBeUndefined();
     expect(state.players[2]!.hand).toHaveLength(5);
@@ -942,6 +1087,7 @@ describe("standard mode", () => {
 
     playCard(state, "p1", "p1-wild4", "blue");
     resolveChallenge(state, "p2", true);
+    settlePendingDraw(state);
 
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.pendingStack).toBeUndefined();
@@ -974,6 +1120,7 @@ describe("standard mode", () => {
     state.players[2]!.hand = [card("p3-green-draw2", "green", "draw2")];
 
     playCard(state, "p1", "p1-red-draw2");
+    settlePendingDraw(state);
     playCard(state, "p2", "p2-blue-draw2");
     expect(state.pendingStack).toMatchObject({ targetPlayerId: "p3", totalDraw: 4 });
 
@@ -1010,6 +1157,7 @@ describe("standard mode", () => {
     state.players[2]!.hand = [card("p3-green-8", "green", 8)];
 
     playCard(state, "p1", "p1-red-draw2");
+    settlePendingDraw(state);
 
     expect(state.pendingStack).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(3);
@@ -1027,6 +1175,7 @@ describe("standard mode", () => {
 
     expect(state.pendingStack).toMatchObject({ targetPlayerId: "p2", totalDraw: 2 });
     drawCard(state, "p2");
+    settlePendingDraw(state);
     expect(state.pendingStack).toBeUndefined();
     expect(state.players[1]!.hand).toHaveLength(4);
     expect(snapshotFor(state).currentPlayerId).toBe("p3");
@@ -1185,6 +1334,7 @@ describe("standard mode", () => {
     expect(state.pendingChallenge).toMatchObject({ offenderId: "p1", challengerId: "p2", guilty: true, drawCount: 8 });
     const before = state.players[0]!.hand.length;
     resolveChallenge(state, "p2", true);
+    settlePendingDraw(state);
     expect(state.players[0]!.hand).toHaveLength(before + 8);
     expect(snapshotFor(state).currentPlayerId).toBe("p2");
   });
@@ -1267,10 +1417,12 @@ describe("standard mode", () => {
     state.oneWindow!.opensAt = Date.now() - 1;
     state.oneWindow!.deadline = Date.now() + 1000;
     catchOne(state, "p2", "p1");
+    settlePendingDraw(state);
     expect(state.players[0]!.hand.map((item) => item.id)).toContain("p1-catch-red-7");
     expect(state.oneWindow).toBeUndefined();
 
     playCard(state, "p2", "p2-red-draw2");
+    settlePendingDraw(state);
     expect(state.players[2]!.hand).toHaveLength(5);
     expect(snapshotFor(state).currentPlayerId).toBe("p1");
     expect(state.oneWindow).toBeUndefined();
@@ -1290,10 +1442,11 @@ describe("standard mode", () => {
     expect(resolvePendingOneCall(state)).toBe(true);
 
     resolveChallenge(state, "p3", true);
+    settlePendingDraw(state);
     expect(state.pendingChallenge).toBeUndefined();
     expect(state.players[2]!.hand).toHaveLength(11);
     expect(snapshotFor(state).currentPlayerId).toBe("p1");
-    expect(state.oneWindow).toBeUndefined();
+    expect(state.oneWindow?.playerId).toBe("p2");
   });
 
   it("judges a Wild Draw Four played over a declared color by that color, not a buried card", () => {
