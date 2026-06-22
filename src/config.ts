@@ -40,9 +40,15 @@ export function parseConfig(environment: NodeJS.ProcessEnv): AppConfig {
     maxRooms: parsed.MAX_ROOMS,
     turnTimeoutDefault: parsed.TURN_TIMEOUT_DEFAULT,
     reconnectGraceSec: parsed.RECONNECT_GRACE_SEC,
-    logLevel: parsed.LOG_LEVEL
-    ,randomizeFlipPairs: parsed.RANDOMIZE_FLIP_PAIRS === "1"
+    logLevel: parsed.LOG_LEVEL,
+    randomizeFlipPairs: parsed.RANDOMIZE_FLIP_PAIRS === "1"
   };
 }
 
 export const config = parseConfig(process.env);
+
+// Emit a small runtime hint so operators can verify randomization setting.
+if (config.nodeEnv !== "test") {
+  // eslint-disable-next-line no-console
+  console.info(`config: nodeEnv=${config.nodeEnv}, randomizeFlipPairs=${config.randomizeFlipPairs}`);
+}

@@ -47,7 +47,10 @@ export function buildFlipDeckBox(deckIndex: number): Card[] {
   let actionPairs: Array<[CardValue, CardValue]>;
 
   // Enable randomization in production by default, or when enabled in config.
-  if (config.nodeEnv === "production" || config.randomizeFlipPairs) {
+  // Check `process.env.NODE_ENV` as a fallback so starting the process with
+  // NODE_ENV=production always triggers randomization even if config parsing
+  // happens earlier or is overwritten.
+  if (process.env.NODE_ENV === "production" || config.nodeEnv === "production" || config.randomizeFlipPairs) {
     const shuffledDarkColors = shuffleCards([...DARK_COLORS]);
     darkForLight = {};
     for (let i = 0; i < LIGHT_COLORS.length; i += 1) {
