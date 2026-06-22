@@ -294,6 +294,39 @@ export interface GameLogEntry {
   at: number;
 }
 
+export type PresentationEventKind =
+  | "cardPlayed"
+  | "draw"
+  | "penalty"
+  | "skip"
+  | "reverse"
+  | "wild"
+  | "stack"
+  | "batch"
+  | "challenge"
+  | "one"
+  | "catch"
+  | "deal"
+  | "shuffle"
+  | "flip"
+  | "pause"
+  | "resume"
+  | "roundEnd";
+
+export interface PresentationEvent {
+  id: number;
+  seq: number;
+  kind: PresentationEventKind;
+  actorId?: string;
+  targetIds?: string[];
+  cardValue?: CardValue;
+  color?: Color;
+  amount?: number;
+  level?: number;
+  startsAt: number;
+  resolvesAt: number;
+}
+
 export interface RoundScorePlayer {
   playerId: string;
   cardCount: number;
@@ -339,6 +372,7 @@ export interface GameSnapshot {
   drawPileCount: number;
   drawPileBack?: OpponentCardFace;
   actionLog: GameLogEntry[];
+  presentationEvents?: PresentationEvent[];
   roundWinnerId?: string;
   gameWinnerId?: string;
   lastStandPlacements?: LastStandPlacement[];

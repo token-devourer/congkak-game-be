@@ -16,6 +16,8 @@ import type {
   ParticipantRole,
   PendingChallenge,
   PendingStack,
+  PresentationEvent,
+  PresentationEventKind,
   PublicPlayer,
   PublicViewer,
   RoomSettings,
@@ -64,6 +66,7 @@ const DRAW_REVEAL_FACE_AT_MS = 80;
 const DRAW_NEXT_GAP_MS = 40;
 const DRAW_SYNC_EXTRA_MS = 80;
 const DRAW_FINAL_SETTLE_MS = 700;
+const PRESENTATION_EVENT_HISTORY = 32;
 
 export interface PlayerState extends PublicPlayer {
   hand: Card[];
@@ -139,6 +142,8 @@ export interface GameStateInternal {
   roundNumber: number;
   seq: number;
   actionLog: GameLogEntry[];
+  presentationEvents: PresentationEvent[];
+  presentationEventSeq: number;
   roundWinnerId?: string;
   gameWinnerId?: string;
   lastStandPlacements?: LastStandPlacement[];
@@ -174,6 +179,8 @@ export function createGame(code: string, settings?: RoomSettingsInput): GameStat
     roundNumber: 0,
     seq: 0,
     actionLog: [],
+    presentationEvents: [],
+    presentationEventSeq: 0,
     dealEventSeq: 0,
     flipEventSeq: 0,
     drawEventSeq: 0
@@ -556,6 +563,12 @@ export function reshuffleRoundDeck(state: GameStateInternal, playerId: string): 
     resolvesAt: startsAt + SHUFFLE_DURATION_MS
   };
   delete deal.inactivityDeadline;
+  emitPresentation(state, {
+    kind: "shuffle",
+    actorId: playerId,
+    startsAt,
+    resolvesAt: deal.event.resolvesAt
+  });
 }
 
 export function beginManualDeal(state: GameStateInternal, playerId: string): void {
@@ -782,7 +795,13 @@ export function playCard(
   if (card.value !== "flip") {
     updateOneWindowAfterPlay(state, player);
   }
-  pushLog(state, "play", `${player.nickname} played ${cardLabel(card)}.`);
+  pushLog(state, "play", `${player.nickname} played ${cardLabel(card)}.`, {
+    kind: "cardPlayed",
+    actorId: player.id,
+    cardValue: card.value,
+    ...(state.activeColor ? { color: state.activeColor } : {}),
+    level: sameValueDiscardRun(state, card.value)
+  });
   if (stacking) {
     applyStackedCard(state, player, card);
   } else {
@@ -902,6 +921,16 @@ export function playBatch(
   delete player.drawnCardId;
   delete state.turnDeadline;
   delete state.autoPlayPendingAt;
+  emitPresentation(state, {
+    kind: "batch",
+    actorId: player.id,
+    cardValue: value,
+    ...(declaredColor ? { color: declaredColor } : {}),
+    amount: orderedCards.length,
+    level: Math.min(8, orderedCards.length),
+    startsAt,
+    resolvesAt: state.pendingBatchPlay.resolvesAt
+  });
 }
 
 export function resolvePendingBatchPlay(state: GameStateInternal): boolean {
@@ -935,7 +964,7 @@ export function resolvePendingBatchPlay(state: GameStateInternal): boolean {
   if (finalCard.value !== "flip") {
     updateOneWindowAfterPlay(state, player);
   }
-  pushLog(state, "batch", `${player.nickname} played a batch of ${pending.cards.length} ${batchValueLabel(finalCard)} cards.`);
+  pushLog(state, "batch", `${player.nickname} played a batch of ${pending.cards.length} ${batchValueLabel(finalCard)} cards.`, false);
   applyBatchCards(state, player, pending.cards, pending.handBefore, pending.activeColorBefore);
 
   if (!state.pendingChallenge && !state.pendingStack && !state.pendingFlip && !state.pendingDraw && player.hand.length === 0) {
@@ -966,7 +995,15 @@ function scheduleFlip(state: GameStateInternal, playerId: string, count: number,
   };
   delete state.turnDeadline;
   delete state.autoPlayPendingAt;
-  pushLog(state, "play", `${findPlayer(state, playerId).nickname} flipped the deck ${count} time${count === 1 ? "" : "s"}.`);
+  emitPresentation(state, {
+    kind: "flip",
+    actorId: playerId,
+    amount: count,
+    level: Math.min(8, count),
+    startsAt,
+    resolvesAt: state.pendingFlip.resolvesAt
+  });
+  pushLog(state, "play", `${findPlayer(state, playerId).nickname} flipped the deck ${count} time${count === 1 ? "" : "s"}.`, false);
 }
 
 export function resolvePendingFlip(state: GameStateInternal): boolean {
@@ -1096,7 +1133,7 @@ export function callOne(state: GameStateInternal, playerId: string, automated = 
     player.calledOne = true;
     delete state.oneWindow;
     delete state.pendingOneCall;
-    pushLog(state, "one", `${player.nickname} called One.`);
+    pushLog(state, "one", `${player.nickname} called One.`, { kind: "one", actorId: player.id });
     return;
   }
 
@@ -1141,7 +1178,12 @@ export function catchOne(state: GameStateInternal, catcherId: string, targetId: 
   // Closing the window is the double-catch guard; the caught player must NOT
   // be credited with a One call they never made.
   closeOneWindowForPlayer(state, target.id);
-  pushLog(state, "one", `${catcher.nickname} caught ${target.nickname}.`);
+  pushLog(state, "one", `${catcher.nickname} caught ${target.nickname}.`, {
+    kind: "catch",
+    actorId: catcher.id,
+    targetIds: [target.id],
+    amount: 2
+  });
   queueFixedDraw(state, target, 2, "catch", { type: "setDeadline" });
 }
 
@@ -1291,7 +1333,8 @@ export function snapshotFor(state: GameStateInternal, playerId?: string): GameSn
     direction: state.direction,
     roundNumber: state.roundNumber,
     drawPileCount: state.drawPile.length + Math.max(0, (state.dealQueue?.cards.length ?? 0) - (state.dealQueue?.nextIndex ?? 0)),
-    actionLog: state.actionLog.slice(-30)
+    actionLog: state.actionLog.slice(-30),
+    presentationEvents: state.presentationEvents.slice(-PRESENTATION_EVENT_HISTORY)
   };
 
   if (self) {
@@ -1548,7 +1591,12 @@ function applyBatchCards(
     }
     state.currentSeat = seatAfter(state, skippedSeat);
     setTurnDeadline(state);
-    pushLog(state, "skip", `${count} players were skipped by the batch.`);
+    pushLog(state, "skip", `${count} players were skipped by the batch.`, {
+      kind: "skip",
+      actorId: player.id,
+      amount: count,
+      level: Math.min(8, count)
+    });
     return;
   }
 
@@ -1558,7 +1606,12 @@ function applyBatchCards(
     }
     state.currentSeat = activePlayers(state).length === 2 ? player.seat : seatAfter(state, player.seat);
     setTurnDeadline(state);
-    pushLog(state, "reverse", `Turn direction changed ${count} times.`);
+    pushLog(state, "reverse", `Turn direction changed ${count} times.`, {
+      kind: "reverse",
+      actorId: player.id,
+      amount: count,
+      level: Math.min(8, count)
+    });
     return;
   }
 
@@ -1577,7 +1630,13 @@ function applyBatchCards(
 
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     state.currentSeat = seatAfter(state, target.seat);
-    pushLog(state, "draw", `${target.nickname} drew ${totalDraw} cards.`);
+    pushLog(state, "draw", `${target.nickname} drew ${totalDraw} cards.`, {
+      kind: "penalty",
+      actorId: player.id,
+      targetIds: [target.id],
+      amount: totalDraw,
+      level: Math.min(8, count)
+    });
     queueFixedDraw(state, target, totalDraw, "penalty", { type: "setDeadline", offenderId: player.id });
     return;
   }
@@ -1650,7 +1709,12 @@ function applyBatchCards(
   }
 
   if (value === "wild") {
-    pushLog(state, "wild", `Active color is ${state.activeColor}.`);
+    pushLog(state, "wild", `Active color is ${state.activeColor}.`, {
+      kind: "wild",
+      actorId: player.id,
+      ...(state.activeColor ? { color: state.activeColor } : {}),
+      level: Math.min(8, count)
+    });
   }
 
   advanceTurn(state);
@@ -1682,7 +1746,13 @@ function applyStackedBatch(state: GameStateInternal, player: PlayerState, amount
   };
   state.currentSeat = target.seat;
   setTurnDeadline(state);
-  pushLog(state, "draw", `${target.nickname} must stack or draw ${stack.totalDraw + amount} cards.`);
+  pushLog(state, "draw", `${target.nickname} must stack or draw ${stack.totalDraw + amount} cards.`, {
+    kind: "stack",
+    actorId: player.id,
+    targetIds: [target.id],
+    amount: stack.totalDraw + amount,
+    level: Math.min(8, Math.max(1, Math.ceil((stack.totalDraw + amount) / 2)))
+  });
   settlePendingStackIfUnstackable(state);
 }
 
@@ -1703,14 +1773,25 @@ function applyPlayedCard(
 ): void {
   if (card.value === "skip") {
     const skipped = findPlayerBySeat(state, seatAfter(state, player.seat));
-    pushLog(state, "skip", `${skipped.nickname} was skipped.`);
+    pushLog(state, "skip", `${skipped.nickname} was skipped.`, {
+      kind: "skip",
+      actorId: player.id,
+      targetIds: [skipped.id],
+      amount: 1,
+      level: sameValueDiscardRun(state, card.value)
+    });
     advanceTurn(state, 1);
     return;
   }
 
   if (card.value === "reverse") {
     state.direction = state.direction === 1 ? -1 : 1;
-    pushLog(state, "reverse", "Turn direction changed.");
+    pushLog(state, "reverse", "Turn direction changed.", {
+      kind: "reverse",
+      actorId: player.id,
+      amount: 1,
+      level: sameValueDiscardRun(state, card.value)
+    });
     advanceTurn(state, activePlayers(state).length === 2 ? 1 : 0);
     return;
   }
@@ -1724,7 +1805,13 @@ function applyPlayedCard(
 
     const target = findPlayerBySeat(state, seatAfter(state, player.seat));
     state.currentSeat = seatAfter(state, target.seat);
-    pushLog(state, "draw", `${target.nickname} drew ${amount} cards.`);
+    pushLog(state, "draw", `${target.nickname} drew ${amount} cards.`, {
+      kind: "penalty",
+      actorId: player.id,
+      targetIds: [target.id],
+      amount,
+      level: sameValueDiscardRun(state, card.value)
+    });
     queueFixedDraw(state, target, amount, "penalty", { type: "setDeadline", offenderId: player.id });
     return;
   }
@@ -1791,7 +1878,12 @@ function applyPlayedCard(
   }
 
   if (card.value === "wild") {
-    pushLog(state, "wild", `Active color is ${state.activeColor}.`);
+    pushLog(state, "wild", `Active color is ${state.activeColor}.`, {
+      kind: "wild",
+      actorId: player.id,
+      ...(state.activeColor ? { color: state.activeColor } : {}),
+      level: sameValueDiscardRun(state, card.value)
+    });
   }
 
   advanceTurn(state);
@@ -1838,7 +1930,14 @@ function startStack(
   }
   state.currentSeat = target.seat;
   setTurnDeadline(state);
-  pushLog(state, challenge ? "wild" : "draw", `${target.nickname} must ${challenge ? "choose: challenge, stack, or accept" : "stack or draw"} ${amount} cards.`);
+  pushLog(state, challenge ? "wild" : "draw", `${target.nickname} must ${challenge ? "choose: challenge, stack, or accept" : "stack or draw"} ${amount} cards.`, {
+    kind: "stack",
+    actorId: player.id,
+    targetIds: [target.id],
+    amount,
+    level: Math.min(8, Math.max(1, Math.ceil(amount / 2))),
+    ...(state.activeColor ? { color: state.activeColor } : {})
+  });
   if (!challenge) {
     settlePendingStackIfUnstackable(state);
   }
@@ -1871,7 +1970,13 @@ function applyStackedCard(state: GameStateInternal, player: PlayerState, card: C
   };
   state.currentSeat = target.seat;
   setTurnDeadline(state);
-  pushLog(state, "draw", `${target.nickname} must stack or draw ${stack.totalDraw + amount} cards.`);
+  pushLog(state, "draw", `${target.nickname} must stack or draw ${stack.totalDraw + amount} cards.`, {
+    kind: "stack",
+    actorId: player.id,
+    targetIds: [target.id],
+    amount: stack.totalDraw + amount,
+    level: Math.min(8, Math.max(1, Math.ceil((stack.totalDraw + amount) / 2)))
+  });
   settlePendingStackIfUnstackable(state);
 }
 
@@ -2049,6 +2154,15 @@ function maybeCompleteLastStandRound(state: GameStateInternal): boolean {
   }
 
   state.phase = "roundEnd";
+  if (state.roundWinnerId) {
+    emitPresentation(state, {
+      kind: "roundEnd",
+      actorId: state.roundWinnerId,
+      targetIds: loser ? [loser.id] : [],
+      startsAt: Date.now(),
+      resolvesAt: Date.now() + 2_000
+    });
+  }
   delete state.turnDeadline;
   delete state.pendingChallenge;
   delete state.pendingStack;
@@ -2111,7 +2225,12 @@ function completeRound(state: GameStateInternal, winnerId: string): void {
   delete state.pendingStack;
   delete state.oneWindow;
   delete state.pendingOneCall;
-  pushLog(state, "round", `${winner.nickname} won the round with ${score} points.`);
+  pushLog(state, "round", `${winner.nickname} won the round with ${score} points.`, {
+    kind: "roundEnd",
+    actorId: winner.id,
+    targetIds: losers.map((player) => player.id),
+    amount: score
+  });
 }
 
 function finalizePendingOneCall(state: GameStateInternal): void {
@@ -2129,7 +2248,7 @@ function finalizePendingOneCall(state: GameStateInternal): void {
 
   player.calledOne = true;
   delete state.oneWindow;
-  pushLog(state, "one", `${player.nickname} called One.`);
+  pushLog(state, "one", `${player.nickname} called One.`, { kind: "one", actorId: player.id });
 }
 
 function closeOneWindowForPlayer(state: GameStateInternal, playerId: string): void {
@@ -2248,6 +2367,17 @@ function startPendingDraw(state: GameStateInternal, pending: PendingDrawInternal
   }
   delete state.turnDeadline;
   delete state.autoPlayPendingAt;
+  const amount = pending.totalCount ?? pending.requiredMatches ?? 1;
+  const startsAt = Date.now() + drawSyncLead(state);
+  emitPresentation(state, {
+    kind: pending.reason === "turn" ? "draw" : "penalty",
+    targetIds: [pending.playerId],
+    amount,
+    level: Math.min(8, Math.max(1, amount)),
+    ...(pending.targetColor ? { color: pending.targetColor } : {}),
+    startsAt,
+    resolvesAt: startsAt + Math.max(1, amount) * (DRAW_REVEAL_DURATION_MS + DRAW_NEXT_GAP_MS) + DRAW_FINAL_SETTLE_MS
+  });
   if (pending.mode === "auto") {
     scheduleNextPendingDraw(state);
   }
@@ -2575,6 +2705,13 @@ function scheduleDealSequence(state: GameStateInternal, targetPlayerIds: string[
   state.dealQueue = { cards, targetPlayerIds, nextIndex: 0 };
   deal.event = event;
   delete deal.inactivityDeadline;
+  emitPresentation(state, {
+    kind: "deal",
+    targetIds: [...new Set(targetPlayerIds)],
+    amount: targetPlayerIds.length,
+    startsAt,
+    resolvesAt
+  });
 }
 
 function scheduleOpeningCard(state: GameStateInternal): void {
@@ -2596,6 +2733,13 @@ function scheduleOpeningCard(state: GameStateInternal): void {
     startsAt,
     resolvesAt: startsAt + OPENING_DURATION_MS
   };
+  emitPresentation(state, {
+    kind: "cardPlayed",
+    cardValue: opener.value,
+    ...(opener.color ? { color: opener.color } : {}),
+    startsAt,
+    resolvesAt: deal.event.resolvesAt
+  });
 }
 
 function syncDealProgress(state: GameStateInternal): void {
@@ -3172,7 +3316,7 @@ function syncPauseState(state: GameStateInternal): { paused: boolean; changed: b
   if (availablePlayers(state).length < 2) {
     const changed = state.pauseReason !== "notEnoughAvailablePlayers" || state.turnDeadline !== undefined;
     if (!state.pauseReason) {
-      pushLog(state, "room", "Game paused until at least two active players return.");
+      pushLog(state, "room", "Game paused until at least two active players return.", { kind: "pause" });
     }
     state.pauseReason = "notEnoughAvailablePlayers";
     delete state.turnDeadline;
@@ -3185,7 +3329,7 @@ function syncPauseState(state: GameStateInternal): { paused: boolean; changed: b
       state.currentSeat = nextAvailableSeatAfter(state, state.currentSeat);
     }
     state.turnDeadline = Date.now() + state.settings.turnTimeoutSec * 1000;
-    pushLog(state, "room", "Game resumed.");
+    pushLog(state, "room", "Game resumed.", { kind: "resume" });
     return { paused: false, changed: true };
   }
 
@@ -3288,7 +3432,73 @@ function emoteText(emoteId: string): string {
   return map[emoteId] ?? "Hello!";
 }
 
-function pushLog(state: GameStateInternal, type: GameLogEntry["type"], message: string): void {
+type PresentationEventSeed = Omit<PresentationEvent, "id" | "seq" | "startsAt" | "resolvesAt"> & {
+  startsAt?: number;
+  resolvesAt?: number;
+};
+
+const LOG_PRESENTATION_KIND: Partial<Record<GameLogEntry["type"], PresentationEventKind>> = {
+  play: "cardPlayed",
+  batch: "batch",
+  skip: "skip",
+  reverse: "reverse",
+  wild: "wild",
+  challenge: "challenge",
+  one: "one",
+};
+
+function presentationDuration(kind: PresentationEventKind): number {
+  switch (kind) {
+    case "penalty":
+    case "stack":
+    case "roundEnd":
+      return 2_000;
+    case "skip":
+    case "reverse":
+    case "wild":
+    case "challenge":
+    case "one":
+    case "catch":
+    case "flip":
+      return 1_600;
+    case "shuffle":
+      return SHUFFLE_DURATION_MS;
+    default:
+      return 900;
+  }
+}
+
+function sameValueDiscardRun(state: GameStateInternal, value: Card["value"]): number {
+  let run = 0;
+  for (let index = state.discardPile.length - 1; index >= 0; index -= 1) {
+    if (state.discardPile[index]?.value !== value) break;
+    run += 1;
+  }
+  return Math.min(8, Math.max(1, run));
+}
+
+function emitPresentation(state: GameStateInternal, seed: PresentationEventSeed): void {
+  state.presentationEventSeq += 1;
+  const startsAt = seed.startsAt ?? Date.now();
+  state.presentationEvents.push({
+    ...seed,
+    id: state.presentationEventSeq,
+    seq: state.presentationEventSeq,
+    startsAt,
+    resolvesAt: seed.resolvesAt ?? startsAt + presentationDuration(seed.kind)
+  });
+
+  if (state.presentationEvents.length > PRESENTATION_EVENT_HISTORY) {
+    state.presentationEvents = state.presentationEvents.slice(-PRESENTATION_EVENT_HISTORY);
+  }
+}
+
+function pushLog(
+  state: GameStateInternal,
+  type: GameLogEntry["type"],
+  message: string,
+  presentation?: PresentationEventSeed | false
+): void {
   state.seq += 1;
   state.actionLog.push({
     seq: state.seq,
@@ -3299,5 +3509,10 @@ function pushLog(state: GameStateInternal, type: GameLogEntry["type"], message: 
 
   if (state.actionLog.length > 60) {
     state.actionLog = state.actionLog.slice(-60);
+  }
+
+  const fallbackKind = LOG_PRESENTATION_KIND[type];
+  if (presentation !== false && (presentation || fallbackKind)) {
+    emitPresentation(state, presentation ?? { kind: fallbackKind! });
   }
 }
